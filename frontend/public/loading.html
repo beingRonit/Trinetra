@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html class="dark" lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TRINETRA - Neural Interface</title>
+
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;500;700&display=swap"
+        rel="stylesheet" />
+
+    <style>
+        :root {
+            --bg-color: #050505;
+            --accent: #f1f5f9;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--accent);
+            font-family: 'JetBrains Mono', monospace;
+            overflow: hidden;
+        }
+
+        .eye-socket {
+            line-height: 0.8;
+            white-space: pre;
+            font-size: 9px;
+            color: var(--accent);
+            text-shadow: 0 0 6px rgba(255, 255, 255, 0.2);
+        }
+
+        .pupil-layer {
+            position: absolute;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            pointer-events: none;
+        }
+
+        #pupil-track {
+            transition: transform 0.1s ease-out;
+        }
+
+        .pupil-inner {
+            animation: scan 5s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+        }
+
+        .pupil-art {
+            line-height: 0.8;
+            letter-spacing: -1px;
+            white-space: pre;
+            font-size: 9px;
+            color: #000;
+            text-shadow: none;
+        }
+
+        @keyframes scan {
+
+            0%,
+            100% {
+                transform: translateX(-10px);
+            }
+
+            50% {
+                transform: translateX(10px);
+            }
+        }
+
+        @keyframes blink {
+
+            0%,
+            96%,
+            100% {
+                transform: scaleY(1);
+            }
+
+            98% {
+                transform: scaleY(0.05);
+            }
+        }
+
+        .animate-blink {
+            animation: blink 6s ease-in-out infinite;
+        }
+
+        .glitch-text {
+            animation: pulse 4s ease-in-out infinite;
+            letter-spacing: 0.5rem;
+        }
+
+        @keyframes pulse {
+
+            0%,
+            100% {
+                opacity: 0.4;
+            }
+
+            50% {
+                opacity: 1;
+            }
+        }
+
+        .progress-fill {
+            transition: width 0.3s ease;
+        }
+    </style>
+</head>
+
+<body class="min-h-screen flex flex-col p-8">
+
+    <main class="flex-grow flex flex-col items-center justify-center relative">
+
+        <!-- Eye -->
+        <div class="relative flex items-center justify-center animate-blink">
+
+            <pre class="eye-socket">
+                                      ..::::::::::..
+                               .::::::::::::::::::::::::::.
+                          .::::::::::::::::::::::::::::::::::::.
+                      .:::::::::::::::::::::::::::::::::::::::::::::.
+                   .:::::::::::::::::::::::::::::::::::::::::::::::::::.
+                .:::::::::::::::::::::::::::::::::::::::::::::::::::::::::.
+              .:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::.
+            .:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::.
+          .:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::.
+         ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+        ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+        ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+        ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+         ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+          ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+            ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+              ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+                :::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+                   ::::::::::::::::::::::::::::::::::::::::::::::::::::::
+                      :::::::::::::::::::::::::::::::::::::::::::::::
+                          ::::::::::::::::::::::::::::::::::::::
+                               ::::::::::::::::::::::::::::
+                                      ::::::::::::::
+            </pre>
+
+            <div class="pupil-layer">
+                <div id="pupil-track">
+                    <div class="pupil-inner">
+                        <pre class="pupil-art">
+                @@@@@@@@@@
+             @@@@@@@@@@@@@@@@
+           @@@@@@@@@@@@@@@@@@@@
+          @@@@@@@@@@@@@@@@@@@@@@
+         @@@@@@@@@@@@@@@@@@@@@@@@
+        @@@@@@@@@@@@@@@@@@@@@@@@@@
+       @@@@@@@@@@@@@@@@@@@@@@@@@@@@
+       @@@@@@@@@@@@@@@@@@@@@@@@@@@@
+      @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+      @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+      @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+       @@@@@@@@@@@@@@@@@@@@@@@@@@@@
+       @@@@@@@@@@@@@@@@@@@@@@@@@@@@
+        @@@@@@@@@@@@@@@@@@@@@@@@@@
+         @@@@@@@@@@@@@@@@@@@@@@@@
+          @@@@@@@@@@@@@@@@@@@@@@
+           @@@@@@@@@@@@@@@@@@@@
+             @@@@@@@@@@@@@@@@
+                @@@@@@@@@@
+                        </pre>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Title -->
+        <div class="mt-[65px] text-center ml-[20px]">
+            <h1 class="glitch-text text-5xl font-light">TRINETRA</h1>
+        </div>
+
+        <!-- ✅ BOOT STEPS (FIXED POSITION) -->
+        <div class="mt-[120px] flex flex-col gap-2 text-[10px] text-left w-50 mx-auto opacity-70">
+            <div id="step-1"><span class="status">[ -- ]</span> LOADING_NEURAL_WEIGHTS</div>
+            <div id="step-2"><span class="status">[ -- ]</span> INITIALIZING_FAISS_INDEX</div>
+            <div id="step-3"><span class="status">[ -- ]</span> CALIBRATING_CLIP_TRANSFORMER</div>
+            <div id="step-4"><span class="status">[ -- ]</span> ESTABLISHING_SECURE_TUNNEL</div>
+        </div>
+        </div>
+
+    </main>
+
+    <!-- Progress -->
+    <footer class="w-full max-w-2xl mx-auto">
+        <div class="flex justify-between text-[10px] mb-2 opacity-60">
+            <span>INITIALIZING</span>
+            <span id="percent">0%</span>
+        </div>
+        <div class="w-full h-[2px] bg-white/10">
+            <div id="bar" class="progress-fill h-full bg-white w-0"></div>
+        </div>
+    </footer>
+
+    <script>
+        const track = document.getElementById("pupil-track");
+
+        document.addEventListener("mousemove", (e) => {
+            const x = (e.clientX - window.innerWidth / 2) / 40;
+            const y = (e.clientY - window.innerHeight / 2) / 60;
+            track.style.transform = `translate(${x}px, ${y}px)`;
+        });
+
+        let progress = 0;
+        const bar = document.getElementById('bar');
+        const percentText = document.getElementById('percent');
+
+        const steps = [
+            document.getElementById('step-1'),
+            document.getElementById('step-2'),
+            document.getElementById('step-3'),
+            document.getElementById('step-4')
+        ];
+
+        function markDone(idx) {
+            const step = steps[idx];
+            if (step && !step.classList.contains('text-white')) {
+                step.classList.add('text-white');
+                step.querySelector('.status').innerText = '[ OK ]';
+            }
+        }
+
+        function startBoot() {
+            const interval = setInterval(() => {
+                let inc = progress > 80 ? Math.random() * 0.5 : Math.random() * 3;
+                progress += inc;
+
+                if (progress >= 100) {
+                    progress = 100;
+                    clearInterval(interval);
+                    percentText.innerText = "READY";
+                    return;
+                }
+
+                bar.style.width = progress + '%';
+                percentText.innerText = Math.floor(progress) + '%';
+
+                if (progress > 25) markDone(0);
+                if (progress > 50) markDone(1);
+                if (progress > 75) markDone(2);
+                if (progress > 95) markDone(3);
+
+            }, 80);
+        }
+
+        window.onload = startBoot;
+    </script>
+
+</body>
+
+</html>
