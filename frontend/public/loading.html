@@ -1,14 +1,15 @@
 <!DOCTYPE html>
 <html class="dark" lang="en">
-
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>TRINETRA - Neural Interface</title>
 
     <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;500;700&display=swap"
-        rel="stylesheet" />
+    <link
+        href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;500;700&display=swap"
+        rel="stylesheet"
+    />
 
     <style>
         :root {
@@ -16,10 +17,20 @@
             --accent: #f1f5f9;
         }
 
+        * {
+            box-sizing: border-box;
+        }
+
+        html,
+        body {
+            margin: 0;
+            min-height: 100%;
+        }
+
         body {
             background-color: var(--bg-color);
             color: var(--accent);
-            font-family: 'JetBrains Mono', monospace;
+            font-family: "JetBrains Mono", monospace;
             overflow: hidden;
         }
 
@@ -57,7 +68,6 @@
         }
 
         @keyframes scan {
-
             0%,
             100% {
                 transform: translateX(-10px);
@@ -69,7 +79,6 @@
         }
 
         @keyframes blink {
-
             0%,
             96%,
             100% {
@@ -91,7 +100,6 @@
         }
 
         @keyframes pulse {
-
             0%,
             100% {
                 opacity: 0.4;
@@ -107,14 +115,9 @@
         }
     </style>
 </head>
-
 <body class="min-h-screen flex flex-col p-8">
-
-    <main class="flex-grow flex flex-col items-center justify-center relative">
-
-        <!-- Eye -->
+    <main class="relative flex flex-grow flex-col items-center justify-center">
         <div class="relative flex items-center justify-center animate-blink">
-
             <pre class="eye-socket">
                                       ..::::::::::..
                                .::::::::::::::::::::::::::.
@@ -170,30 +173,25 @@
             </div>
         </div>
 
-        <!-- Title -->
-        <div class="mt-[65px] text-center ml-[20px]">
+        <div class="mt-[65px] ml-[20px] text-center">
             <h1 class="glitch-text text-5xl font-light">TRINETRA</h1>
         </div>
 
-        <!-- ✅ BOOT STEPS (FIXED POSITION) -->
-        <div class="mt-[120px] flex flex-col gap-2 text-[10px] text-left w-50 mx-auto opacity-70">
+        <div class="mt-[120px] mx-auto flex w-50 flex-col gap-2 text-left text-[10px] opacity-70">
             <div id="step-1"><span class="status">[ -- ]</span> LOADING_NEURAL_WEIGHTS</div>
             <div id="step-2"><span class="status">[ -- ]</span> INITIALIZING_FAISS_INDEX</div>
             <div id="step-3"><span class="status">[ -- ]</span> CALIBRATING_CLIP_TRANSFORMER</div>
             <div id="step-4"><span class="status">[ -- ]</span> ESTABLISHING_SECURE_TUNNEL</div>
         </div>
-        </div>
-
     </main>
 
-    <!-- Progress -->
-    <footer class="w-full max-w-2xl mx-auto">
-        <div class="flex justify-between text-[10px] mb-2 opacity-60">
+    <footer class="mx-auto w-full max-w-2xl">
+        <div class="mb-2 flex justify-between text-[10px] opacity-60">
             <span>INITIALIZING</span>
             <span id="percent">0%</span>
         </div>
-        <div class="w-full h-[2px] bg-white/10">
-            <div id="bar" class="progress-fill h-full bg-white w-0"></div>
+        <div class="h-[2px] w-full bg-white/10">
+            <div id="bar" class="progress-fill h-full w-0 bg-white"></div>
         </div>
     </footer>
 
@@ -207,50 +205,52 @@
         });
 
         let progress = 0;
-        const bar = document.getElementById('bar');
-        const percentText = document.getElementById('percent');
+        const bar = document.getElementById("bar");
+        const percentText = document.getElementById("percent");
 
         const steps = [
-            document.getElementById('step-1'),
-            document.getElementById('step-2'),
-            document.getElementById('step-3'),
-            document.getElementById('step-4')
+            document.getElementById("step-1"),
+            document.getElementById("step-2"),
+            document.getElementById("step-3"),
+            document.getElementById("step-4"),
         ];
 
         function markDone(idx) {
             const step = steps[idx];
-            if (step && !step.classList.contains('text-white')) {
-                step.classList.add('text-white');
-                step.querySelector('.status').innerText = '[ OK ]';
+            if (step && !step.classList.contains("text-white")) {
+                step.classList.add("text-white");
+                step.querySelector(".status").innerText = "[ OK ]";
             }
         }
 
         function startBoot() {
             const interval = setInterval(() => {
-                let inc = progress > 80 ? Math.random() * 0.5 : Math.random() * 3;
+                const inc = progress > 80 ? Math.random() * 0.5 : Math.random() * 3;
                 progress += inc;
 
                 if (progress >= 100) {
                     progress = 100;
                     clearInterval(interval);
+                    bar.style.width = "100%";
+                    markDone(0);
+                    markDone(1);
+                    markDone(2);
+                    markDone(3);
                     percentText.innerText = "READY";
                     return;
                 }
 
-                bar.style.width = progress + '%';
-                percentText.innerText = Math.floor(progress) + '%';
+                bar.style.width = progress + "%";
+                percentText.innerText = Math.floor(progress) + "%";
 
                 if (progress > 25) markDone(0);
                 if (progress > 50) markDone(1);
                 if (progress > 75) markDone(2);
                 if (progress > 95) markDone(3);
-
             }, 80);
         }
 
         window.onload = startBoot;
     </script>
-
 </body>
-
 </html>

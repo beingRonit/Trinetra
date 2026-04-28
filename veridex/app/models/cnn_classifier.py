@@ -47,5 +47,5 @@ class CNNClassifier:
         return {
             "real_probability": real_prob,
             "ai_probability": ai_prob,
-            "score": int(ai_prob * 40)
+            "score": int(round(ai_prob * 100))
         }

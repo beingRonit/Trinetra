@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     SMTP_FROM_EMAIL: str = ""
     SMTP_FROM_NAME: str = "TRINETRA Security"
     SMTP_USE_TLS: bool = True
+    SMTP_USE_SSL: bool = False
+    SMTP_TIMEOUT_SECONDS: int = 40
     SERPER_API_KEY: str = ""
 
     model_config = {"env_file": ".env", "extra": "ignore"}

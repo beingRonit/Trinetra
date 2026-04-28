@@ -6,6 +6,7 @@ from slowapi.errors import RateLimitExceeded
 from app.routes.analyze import router as analyze_router
 from app.routes.heatmap import router as heatmap_router
 from app.routes.feedback import router as feedback_router
+from app.routes.intelligence import router as intelligence_router
 from app.db.database import engine
 from app.db.models import Base
 from app.utils.training_utils import get_training_stats, retrain_from_staging
@@ -29,6 +30,7 @@ app.add_middleware(
 app.include_router(analyze_router)
 app.include_router(heatmap_router)
 app.include_router(feedback_router)
+app.include_router(intelligence_router)
 
 Base.metadata.create_all(bind=engine)
 

@@ -4,9 +4,63 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Trinetra OS - Image Authenticity System</title>
+    <style>
+      html, body {
+        margin: 0;
+        min-height: 100%;
+        background: #000;
+      }
+
+      body {
+        overflow: hidden;
+      }
+
+      #entry-boot {
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        background: #000;
+        opacity: 1;
+        transition: opacity 280ms ease;
+      }
+
+      #entry-boot.is-hidden {
+        opacity: 0;
+        pointer-events: none;
+      }
+
+      #entry-boot iframe {
+        width: 100%;
+        height: 100%;
+        border: 0;
+        display: block;
+        background: #000;
+      }
+    </style>
   </head>
   <body>
+    <div id="entry-boot" aria-hidden="true">
+      <iframe src="/loading.html" title="Trinetra Loading Screen"></iframe>
+    </div>
     <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
+    <script type="module">
+      const boot = document.getElementById('entry-boot');
+      const minBootTime = 2800;
+      const start = Date.now();
+
+      const finishBoot = async () => {
+        sessionStorage.setItem('trinetra_entry_boot_done', 'true');
+        await import('/src/main.tsx');
+        const elapsed = Date.now() - start;
+        const remaining = Math.max(0, minBootTime - elapsed);
+
+        window.setTimeout(() => {
+          boot?.classList.add('is-hidden');
+          window.setTimeout(() => boot?.remove(), 320);
+        }, remaining);
+      };
+
+      void finishBoot();
+    </script>
   </body>
 </html>

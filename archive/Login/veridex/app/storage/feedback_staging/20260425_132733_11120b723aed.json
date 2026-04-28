@@ -1,0 +1,10 @@
+{
+  "image_hash": "11120b723aed801e077bbb22fb0a68d26a5592d6d7d004c6ca903023b9be91da",
+  "image_path": null,
+  "original_score": 50.0,
+  "user_label": "WRONG",
+  "meta_score": 20.0,
+  "forensic_score": 10.0,
+  "classifier_score": 0.0,
+  "similarity_score": 0.0
+}

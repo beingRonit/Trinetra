@@ -2112,6 +2112,9 @@ const fetchWithStoredAuth = async (input: RequestInfo | URL, init: RequestInit =
   return fetch(input, { ...init, headers });
 };
 
+const isServiceUnavailableMessage = (message: string) =>
+  /failed to fetch|networkerror|network request failed|load failed|ecconnrefused|fetch failed/i.test(message);
+
 const PROTECTED_ASSET_CACHE_PREFIX = 'trinetra_protected_assets_';
 const PROTECTED_CERTIFICATE_CACHE_PREFIX = 'trinetra_protected_certificate_';
 
@@ -2331,12 +2334,14 @@ const ResultsDashboard = () => {
   const [dashboard, setDashboard] = useState<DashboardSummaryPayload | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [backendWarning, setBackendWarning] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [takedownId, setTakedownId] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [localAssetRevision, setLocalAssetRevision] = useState(0);
   const isGuest = localStorage.getItem('trinetra_guest_mode') === 'true';
   const userEmail = localStorage.getItem('trinetra_user_email') || 'unknown';
+  const hasLoadedRef = useRef(false);
 
   const loadDashboard = useCallback(async () => {
     if (isGuest) {
@@ -2354,6 +2359,7 @@ const ResultsDashboard = () => {
     try {
       setIsLoading(true);
       setError(null);
+      setBackendWarning(null);
       setActionMessage(null);
       const response = await fetchWithStoredAuth('/api/dashboard/summary');
       const result = await parseApiResponse<DashboardSummaryPayload | { detail?: string }>(response);
@@ -2368,13 +2374,22 @@ const ResultsDashboard = () => {
         ensureUserProfile(result.user.email, result.user.joined_at);
       }
     } catch (loadError) {
-      setError(loadError instanceof Error ? loadError.message : 'Failed to load dashboard');
+      const message = loadError instanceof Error ? loadError.message : 'Failed to load dashboard';
+      if (isServiceUnavailableMessage(message)) {
+        setDashboard(null);
+        setError(null);
+        setBackendWarning('Dashboard backend is offline. Showing locally protected assets only.');
+      } else {
+        setError(message);
+      }
     } finally {
       setIsLoading(false);
     }
   }, [isGuest]);
 
   useEffect(() => {
+    if (hasLoadedRef.current) return;
+    hasLoadedRef.current = true;
     void loadDashboard();
   }, [loadDashboard]);
 
@@ -2509,6 +2524,11 @@ const ResultsDashboard = () => {
           <RefreshCw className="w-3.5 h-3.5" /> REFRESH
         </Button>
       </header>
+      {backendWarning ? (
+        <div className="border border-tertiary/40 bg-tertiary/10 p-3 font-mono text-xs text-tertiary">
+          {backendWarning}
+        </div>
+      ) : null}
       {actionMessage ? (
         <div className={`border p-3 font-mono text-xs ${actionMessage.type === 'success' ? 'border-primary/40 bg-primary/10 text-primary' : 'border-error/40 bg-error/10 text-error'}`}>
           {actionMessage.text}
@@ -2936,12 +2956,14 @@ const HistoryTable = () => {
   const [historyData, setHistoryData] = useState<DashboardSummaryPayload | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [backendWarning, setBackendWarning] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [takedownId, setTakedownId] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [localAssetRevision, setLocalAssetRevision] = useState(0);
   const isGuest = localStorage.getItem('trinetra_guest_mode') === 'true';
   const userEmail = localStorage.getItem('trinetra_user_email') || 'unknown';
+  const hasLoadedRef = useRef(false);
 
   const loadHistory = useCallback(async () => {
     if (isGuest) {
@@ -2959,6 +2981,7 @@ const HistoryTable = () => {
     try {
       setIsLoading(true);
       setError(null);
+      setBackendWarning(null);
       setActionMessage(null);
       const response = await fetchWithStoredAuth('/api/dashboard/summary?limit=50');
       const result = await parseApiResponse<DashboardSummaryPayload | { detail?: string }>(response);
@@ -2970,13 +2993,22 @@ const HistoryTable = () => {
       }
       setHistoryData(result);
     } catch (loadError) {
-      setError(loadError instanceof Error ? loadError.message : 'Failed to load history');
+      const message = loadError instanceof Error ? loadError.message : 'Failed to load history';
+      if (isServiceUnavailableMessage(message)) {
+        setHistoryData(null);
+        setError(null);
+        setBackendWarning('History backend is offline. Showing locally protected assets only.');
+      } else {
+        setError(message);
+      }
     } finally {
       setIsLoading(false);
     }
   }, [isGuest]);
 
   useEffect(() => {
+    if (hasLoadedRef.current) return;
+    hasLoadedRef.current = true;
     void loadHistory();
   }, [loadHistory]);
 
@@ -3048,6 +3080,11 @@ const HistoryTable = () => {
       {actionMessage ? (
         <div className={`border p-3 font-mono text-xs ${actionMessage.type === 'success' ? 'border-primary/40 bg-primary/10 text-primary' : 'border-error/40 bg-error/10 text-error'}`}>
           {actionMessage.text}
+        </div>
+      ) : null}
+      {backendWarning ? (
+        <div className="border border-tertiary/40 bg-tertiary/10 p-3 font-mono text-xs text-tertiary">
+          {backendWarning}
         </div>
       ) : null}
 
@@ -4308,7 +4345,13 @@ function ClerkTerminateButton({ onTerminate, onClose }: { onTerminate: () => voi
 // --- Main App Logic ---
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<AppState>('BOOT');
+  const [activeTab, setActiveTab] = useState<AppState>(() => {
+    if (typeof window !== 'undefined' && window.sessionStorage.getItem('trinetra_entry_boot_done') === 'true') {
+      window.sessionStorage.removeItem('trinetra_entry_boot_done');
+      return hasActiveStoredSession() ? 'DASHBOARD' : 'AUTH';
+    }
+    return 'BOOT';
+  });
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
   const [authMode, setAuthMode] = useState<AuthProviderMode>(() => getStoredAuthMode());

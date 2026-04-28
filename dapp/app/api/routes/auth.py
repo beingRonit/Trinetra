@@ -5,6 +5,7 @@ from secrets import randbelow
 import hashlib
 import os
 import smtplib
+import ssl
 from threading import Lock
 from pathlib import Path
 
@@ -44,6 +45,8 @@ def _auth_settings() -> dict[str, str]:
       "SMTP_FROM_EMAIL": os.getenv("SMTP_FROM_EMAIL") or dapp_env.get("SMTP_FROM_EMAIL") or smtp_username,
       "SMTP_FROM_NAME": os.getenv("SMTP_FROM_NAME") or dapp_env.get("SMTP_FROM_NAME") or "TRINETRA Security",
       "SMTP_USE_TLS": os.getenv("SMTP_USE_TLS") or dapp_env.get("SMTP_USE_TLS") or "true",
+      "SMTP_USE_SSL": os.getenv("SMTP_USE_SSL") or dapp_env.get("SMTP_USE_SSL") or "false",
+      "SMTP_TIMEOUT_SECONDS": os.getenv("SMTP_TIMEOUT_SECONDS") or dapp_env.get("SMTP_TIMEOUT_SECONDS") or "40",
       "OTP_EXPIRY_MINUTES": os.getenv("OTP_EXPIRY_MINUTES") or dapp_env.get("OTP_EXPIRY_MINUTES") or "10",
       "OTP_COOLDOWN_SECONDS": os.getenv("OTP_COOLDOWN_SECONDS") or dapp_env.get("OTP_COOLDOWN_SECONDS") or "45",
     }
@@ -58,6 +61,8 @@ SMTP_PASSWORD = AUTH_SETTINGS["SMTP_PASSWORD"]
 SMTP_FROM_EMAIL = AUTH_SETTINGS["SMTP_FROM_EMAIL"] or SMTP_USERNAME
 SMTP_FROM_NAME = AUTH_SETTINGS["SMTP_FROM_NAME"]
 SMTP_USE_TLS = AUTH_SETTINGS["SMTP_USE_TLS"].lower() == "true"
+SMTP_USE_SSL = AUTH_SETTINGS["SMTP_USE_SSL"].lower() == "true"
+SMTP_TIMEOUT_SECONDS = int(AUTH_SETTINGS["SMTP_TIMEOUT_SECONDS"])
 OTP_EXPIRY_MINUTES = int(AUTH_SETTINGS["OTP_EXPIRY_MINUTES"])
 OTP_COOLDOWN_SECONDS = int(AUTH_SETTINGS["OTP_COOLDOWN_SECONDS"])
 
@@ -153,12 +158,30 @@ def _send_email(email: str, otp: str) -> None:
     message.attach(MIMEText(text, "plain", "utf-8"))
     message.attach(MIMEText(html, "html", "utf-8"))
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
-        if SMTP_USE_TLS:
-            server.starttls()
-        if SMTP_USERNAME and SMTP_PASSWORD:
-            server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        server.sendmail(SMTP_FROM_EMAIL, [email], message.as_string())
+    password = SMTP_PASSWORD.replace(" ", "") if SMTP_PASSWORD else ""
+    ssl_context = ssl.create_default_context()
+
+    try:
+        if SMTP_USE_SSL:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS, context=ssl_context) as server:
+                server.ehlo()
+                if SMTP_USERNAME and password:
+                    server.login(SMTP_USERNAME, password)
+                server.sendmail(SMTP_FROM_EMAIL, [email], message.as_string())
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS) as server:
+                server.ehlo()
+                if SMTP_USE_TLS:
+                    server.starttls(context=ssl_context)
+                    server.ehlo()
+                if SMTP_USERNAME and password:
+                    server.login(SMTP_USERNAME, password)
+                server.sendmail(SMTP_FROM_EMAIL, [email], message.as_string())
+    except (TimeoutError, OSError, smtplib.SMTPException) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"OTP email could not be sent. Check SMTP settings or try again. ({exc.__class__.__name__})",
+        ) from exc
 
 
 @router.post("/send-otp")
@@ -180,7 +203,14 @@ async def send_otp(payload: SendOtpRequest):
             "attempts": 0,
         }
 
-    _send_email(email, otp)
+    try:
+        _send_email(email, otp)
+    except HTTPException:
+        with _otp_lock:
+            current = _otp_store.get(email)
+            if current and current["otp_hash"] == _hash_otp(email, otp):
+                _otp_store.pop(email, None)
+        raise
 
     return {
         "status": "sent",

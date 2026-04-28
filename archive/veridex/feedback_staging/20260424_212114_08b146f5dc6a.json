@@ -1,0 +1,14 @@
+{
+  "image_hash": "08b146f5dc6a6fa120f25f6a488c5818357b1e9a517c913c7e01c39e505d5012",
+  "image_path": null,
+  "original_score": 72.0,
+  "user_label": "CORRECT",
+  "model_label": null,
+  "risk_score": null,
+  "confidence": null,
+  "meta_score": 20.0,
+  "forensic_score": 10.0,
+  "classifier_score": 39.0,
+  "similarity_score": 0.0,
+  "timestamp": "2026-04-24T21:21:14.376558"
+}

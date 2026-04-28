@@ -1,0 +1,7 @@
+To start:
+
+python run.py then cli.py
+
+to retrain the data from feedback:
+
+python scripts/retrain_with_feedback.py

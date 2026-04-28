@@ -27,7 +27,11 @@ def main() -> int:
         result = classifier.predict(handle.read())
 
     ai_probability = float(result.get("ai_probability", 0.0))
-    real_probability = max(0.0, 1.0 - ai_probability)
+    real_probability = float(result.get("real_probability", max(0.0, 1.0 - ai_probability)))
+    total = ai_probability + real_probability
+    if total > 0:
+        ai_probability /= total
+        real_probability /= total
 
     if ai_probability >= CNN_THRESHOLD:
         label = "AI GENERATED"
@@ -43,7 +47,7 @@ def main() -> int:
         "threshold": CNN_THRESHOLD,
         "model": "Veridex CNN (ResNet50)",
         "weights": "resnet50_veridex.pt",
-        "raw_score": result.get("score", int(ai_probability * 100)),
+        "raw_score": int(round(ai_probability * 100)),
     }
     print(json.dumps(payload))
     return 0
