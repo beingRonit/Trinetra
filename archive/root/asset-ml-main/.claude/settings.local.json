@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(pip show *)",
-      "Bash(dir /b C:\\\\Users\\\\LENOVO\\\\ml_engine\\\\*.py)"
-    ]
-  }
-}

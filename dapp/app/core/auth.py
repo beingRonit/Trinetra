@@ -8,6 +8,50 @@ SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
 APP_AUTH_SECRET = os.getenv("APP_AUTH_SECRET", "")
 CLERK_JWKS_URL = os.getenv("CLERK_JWKS_URL", "https://api.clerk.com/v1/jwks")
 CLERK_JWT_ISSUER = os.getenv("CLERK_JWT_ISSUER", "")
+USER_EMAIL_HEADER = "X-Trinetra-User-Email"
+
+
+def _normalize_email(value: str | None) -> str:
+    email = (value or "").strip().lower()
+    return email if "@" in email and not email.startswith("@") and not email.endswith("@") else ""
+
+
+def _extract_email(payload: dict, request: Request | None = None) -> str:
+    email = _normalize_email(payload.get("email"))
+    if email:
+        return email
+
+    for claim in ("primary_email", "email_address"):
+        email = _normalize_email(payload.get(claim))
+        if email:
+            return email
+
+    if request:
+        return _normalize_email(request.headers.get(USER_EMAIL_HEADER))
+
+    return ""
+
+
+def get_user_identity(user: dict) -> str:
+    """Return the stable owner key used for assets."""
+    return _normalize_email(user.get("email")) or str(user.get("sub") or user.get("user_id") or "")
+
+
+def get_user_identity_candidates(user: dict) -> list[str]:
+    """Return current and legacy owner keys for backward-compatible asset lookup."""
+    raw_candidates = [
+        get_user_identity(user),
+        str(user.get("sub") or ""),
+        str(user.get("user_id") or ""),
+    ]
+
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for candidate in raw_candidates:
+        if candidate and candidate not in seen:
+            candidates.append(candidate)
+            seen.add(candidate)
+    return candidates
 
 
 def _verify_clerk_token(token: str) -> Optional[dict]:
@@ -73,6 +117,7 @@ async def verify_token(request: Request) -> Optional[dict]:
                 audience="trinetra-users",
             )
             if payload.get("token_type") == "access":
+                payload["email"] = _extract_email(payload, request)
                 return payload
         except jwt.ExpiredSignatureError:
             raise HTTPException(status_code=401, detail="Token expired")
@@ -81,6 +126,7 @@ async def verify_token(request: Request) -> Optional[dict]:
 
     clerk_payload = _verify_clerk_token(token)
     if clerk_payload:
+        clerk_payload["email"] = _extract_email(clerk_payload, request)
         return clerk_payload
 
     if SUPABASE_JWT_SECRET:
@@ -91,6 +137,7 @@ async def verify_token(request: Request) -> Optional[dict]:
                 algorithms=["HS256"],
                 audience="authenticated",
             )
+            payload["email"] = _extract_email(payload, request)
             return payload
         except jwt.ExpiredSignatureError:
             raise HTTPException(status_code=401, detail="Token expired")

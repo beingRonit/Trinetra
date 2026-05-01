@@ -32,6 +32,16 @@ interface SignInPageProps {
 type AuthMode = "signin" | "signup";
 type AuthMessage = { type: "success" | "error"; text: string } | null;
 
+const formatDisplayNameFromEmail = (value: string) =>
+  (() => {
+    const localPart = (value.split("@")[0] || "User")
+      .replace(/[._-]+/g, " ")
+      .trim();
+    const withoutTrailingDigits = localPart.replace(/\d+$/g, "").trim();
+    const cleaned = withoutTrailingDigits || localPart || "User";
+    return cleaned.replace(/\b\w/g, (char) => char.toUpperCase());
+  })();
+
 export const CanvasRevealEffect = ({
   animationSpeed = 10,
   opacities = [0.3, 0.3, 0.3, 0.5, 0.5, 0.5, 0.8, 0.8, 0.8, 1],
@@ -318,6 +328,7 @@ export const SignInPage = ({ className, onSuccess, onGoogleSignIn, googleButtonL
   const [otpSent, setOtpSent] = useState(false);
   const [message, setMessage] = useState<AuthMessage>(null);
   const normalizedEmail = email.trim().toLowerCase();
+  const welcomeName = useMemo(() => formatDisplayNameFromEmail(normalizedEmail || email), [email, normalizedEmail]);
 
   const handleEmailSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -360,6 +371,20 @@ export const SignInPage = ({ className, onSuccess, onGoogleSignIn, googleButtonL
       }, 500);
     }
   }, [step]);
+
+  useEffect(() => {
+    if (step !== "success") {
+      return;
+    }
+
+    const successTimer = window.setTimeout(() => {
+      onSuccess?.();
+    }, 3500);
+
+    return () => {
+      window.clearTimeout(successTimer);
+    };
+  }, [onSuccess, step]);
 
   const handleCodeChange = (index: number, value: string) => {
     const nextValue = value.replace(/\D/g, "");
@@ -516,21 +541,33 @@ export const SignInPage = ({ className, onSuccess, onGoogleSignIn, googleButtonL
                           />
                         </div>
                       </div>
-                      <div className="mx-auto inline-flex rounded-full border border-outline-variant bg-black/70 p-1">
-                        <button
-                          type="button"
-                          onClick={() => handleModeChange("signin")}
-                          className={`rounded-full px-4 py-2 text-sm transition-colors ${mode === "signin" ? "bg-primary text-on-primary" : "text-on-surface-variant hover:text-on-surface"}`}
-                        >
-                          Sign in
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleModeChange("signup")}
-                          className={`rounded-full px-4 py-2 text-sm transition-colors ${mode === "signup" ? "bg-primary text-on-primary" : "text-on-surface-variant hover:text-on-surface"}`}
-                        >
-                          Sign up
-                        </button>
+                      <div className="mx-auto w-fit">
+                        <div className="relative grid w-[min(46vw,170px)] min-w-[148px] grid-cols-2 overflow-hidden rounded-2xl border border-[rgba(152,207,227,0.24)] bg-[rgba(255,255,255,0.05)] p-[3px] backdrop-blur-xl shadow-[inset_1px_1px_4px_rgba(255,255,255,0.14),inset_-1px_-1px_6px_rgba(0,0,0,0.3),0_4px_14px_rgba(0,0,0,0.2)]">
+                          <motion.span
+                            className="absolute bottom-[3px] top-[3px] rounded-[14px] bg-[linear-gradient(135deg,rgba(152,207,227,0.68),rgba(166,213,255,0.96))] shadow-[0_0_18px_rgba(152,207,227,0.3),0_0_10px_rgba(214,239,255,0.28)_inset]"
+                            initial={false}
+                            animate={{ x: mode === "signin" ? 0 : "100%" }}
+                            transition={{ type: "spring", stiffness: 280, damping: 28, mass: 0.9 }}
+                            style={{
+                              left: 3,
+                              width: "calc(50% - 3px)",
+                            }}
+                          />
+                          <button
+                            type="button"
+                            onClick={() => handleModeChange("signin")}
+                            className={`relative z-10 rounded-[14px] px-2 py-[8px] text-[clamp(0.78rem,1.9vw,0.84rem)] font-medium tracking-[-0.01em] transition-colors duration-300 ${mode === "signin" ? "text-black" : "text-[#d6dde2] hover:text-white"}`}
+                          >
+                            Sign in
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleModeChange("signup")}
+                            className={`relative z-10 rounded-[14px] px-2 py-[8px] text-[clamp(0.78rem,1.9vw,0.84rem)] font-medium tracking-[-0.01em] transition-colors duration-300 ${mode === "signup" ? "text-black" : "text-[#d6dde2] hover:text-white"}`}
+                          >
+                            Sign up
+                          </button>
+                        </div>
                       </div>
                       <h1 className="text-[2.25rem] font-bold leading-[1.1] tracking-tight text-on-surface">
                         {mode === "signup" ? "Create your access" : "Welcome back"}
@@ -710,36 +747,50 @@ export const SignInPage = ({ className, onSuccess, onGoogleSignIn, googleButtonL
                 ) : (
                   <motion.div
                     key="success-step"
-                    initial={{ opacity: 0, y: 50 }}
+                    initial={{ opacity: 0, y: 40, scale: 0.98 }}
                     animate={{ opacity: 1, y: 0 }}
-                    transition={{ duration: 0.4, ease: "easeOut", delay: 0.3 }}
+                    transition={{ duration: 0.45, ease: "easeOut", delay: 0.2 }}
                     className="space-y-6 text-center"
                   >
-                    <div className="space-y-2">
-                      <h1 className="text-[2.25rem] font-bold leading-[1.1] tracking-tight text-on-surface">You&apos;re in</h1>
-                      <p className="text-lg font-light text-on-surface-variant">Welcome to the workspace</p>
+                    <div className="mx-auto flex justify-center pb-1">
+                      <div className="relative flex h-24 w-24 items-center justify-center">
+                        <div className="absolute inset-3 rounded-full bg-[radial-gradient(circle,rgba(152,207,227,0.16)_0%,rgba(152,207,227,0.06)_45%,transparent_78%)] blur-lg" />
+                        <img
+                          src={trinetraLogo}
+                          alt="Trinetra logo"
+                          className="relative h-full w-full object-contain opacity-95 brightness-110 contrast-110"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="space-y-3">
+                      <h1 className="text-[2.35rem] font-bold leading-[1.05] tracking-tight text-on-surface">
+                        Welcome {welcomeName}
+                      </h1>
+                      <p className="text-lg font-light text-on-surface-variant">
+                        {mode === "signup" ? "Your secure workspace is being prepared" : "Signing you into the secure workspace"}
+                      </p>
                     </div>
 
                     <motion.div
-                      initial={{ scale: 0.8, opacity: 0 }}
+                      initial={{ scale: 0.92, opacity: 0 }}
                       animate={{ scale: 1, opacity: 1 }}
-                      transition={{ duration: 0.5, delay: 0.5 }}
-                      className="py-10"
+                      transition={{ duration: 0.45, delay: 0.35 }}
+                      className="py-8"
                     >
-                      <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-primary text-on-primary shadow-[0_0_32px_rgba(152,207,227,0.35)]">
-                        <Check className="h-8 w-8" />
+                      <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full border border-primary/30 bg-primary/12 text-primary shadow-[0_0_28px_rgba(152,207,227,0.18)]">
+                        <CircularDotLoader />
                       </div>
                     </motion.div>
 
-                    <motion.button
+                    <motion.p
                       initial={{ opacity: 0 }}
                       animate={{ opacity: 1 }}
-                      transition={{ delay: 1 }}
-                      className="w-full rounded-full bg-primary py-3 font-medium text-on-primary transition-colors hover:bg-primary/90"
-                      onClick={() => onSuccess?.()}
+                      transition={{ delay: 0.6 }}
+                      className="font-mono text-[11px] uppercase tracking-[0.22em] text-outline"
                     >
-                      Continue to Dashboard
-                    </motion.button>
+                      Redirecting to dashboard...
+                    </motion.p>
                   </motion.div>
                 )}
               </AnimatePresence>

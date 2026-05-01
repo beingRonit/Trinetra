@@ -10,6 +10,7 @@ import requests
 from app.core.config import settings
 from app.repositories.asset_repo import asset_repo
 from app.repositories.scan_repo import scan_repo
+from app.schemas.contracts import TakedownReportRequest
 
 
 class TakedownService:
@@ -73,12 +74,57 @@ TRINETRA Monitoring System
 This is an automated message generated for asset protection purposes.
 """.strip()
 
-    def _send_email(self, to_email: str, target_url: str, asset_id: str, confidence: float) -> None:
+    def _build_report_email_body(
+        self, submission: TakedownReportRequest, target_url: str, confidence: float
+    ) -> str:
+        asset_id = submission.asset_id or "Not linked"
+        notes = submission.notes.strip() if submission.notes else "None provided."
+        matched_reference = submission.matched_reference or "Unavailable"
+        matched_source = submission.matched_source or "Unavailable"
+        verdict = submission.verdict or "Pending review"
+        return f"""
+Dear Sir/Madam,
+
+We are submitting a takedown request for a suspected unauthorized use of a protected image.
+
+Reported target:
+URL: {target_url}
+Detected similarity: {confidence * 100:.2f}%
+Detection verdict: {verdict}
+Matched reference: {matched_reference}
+Matched source: {matched_source}
+
+Claimant details:
+Rights holder: {submission.rights_holder}
+Reporter name: {submission.reporter_name}
+Reporter email: {submission.reporter_email}
+Reporter user ID: {submission.reporter_user_id or "Unavailable"}
+Account joined since: {submission.account_joined_since or "Unavailable"}
+
+Asset details:
+Asset ID: {asset_id}
+Filename: {submission.asset_filename}
+MIME type: {submission.asset_mime_type or "Unavailable"}
+Size (bytes): {submission.asset_size_bytes or 0}
+
+Issue summary:
+{submission.issue_summary}
+
+Additional notes:
+{notes}
+
+Please review this material and remove or disable access if the use is unauthorized.
+
+Best regards,
+TRINETRA Monitoring System
+
+---
+This is an automated message generated for asset protection purposes.
+""".strip()
+
+    def _send_email_message(self, to_email: str, subject: str, body: str) -> None:
         if not settings.SMTP_USERNAME or not settings.SMTP_PASSWORD:
             raise ValueError("SMTP credentials are not configured")
-
-        subject = "Notice of Potential Unauthorized Image Usage"
-        body = self._build_email_body(target_url, asset_id, confidence)
 
         msg = MIMEMultipart()
         msg["From"] = settings.SMTP_FROM_EMAIL or settings.SMTP_USERNAME
@@ -96,9 +142,19 @@ This is an automated message generated for asset protection purposes.
                 server.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
                 server.send_message(msg)
 
-    async def trigger_for_media(self, media_id: str, user_id: str) -> dict:
+    def _send_email(self, to_email: str, target_url: str, asset_id: str, confidence: float) -> None:
+        subject = "Notice of Potential Unauthorized Image Usage"
+        body = self._build_email_body(target_url, asset_id, confidence)
+        self._send_email_message(to_email=to_email, subject=subject, body=body)
+
+    def _normalize_confidence(self, final_score: float) -> float:
+        if final_score <= 1:
+            return max(0.0, min(final_score, 1.0))
+        return max(0.0, min(final_score / 100.0, 1.0))
+
+    async def trigger_for_media(self, media_id: str, user_ids: list[str]) -> dict:
         asset = await asset_repo.get_by_id(media_id)
-        if not asset or asset.user_id != user_id:
+        if not asset or str(asset.user_id) not in user_ids:
             raise ValueError("Asset not found")
 
         scan = await scan_repo.get_latest_complete(media_id)
@@ -131,6 +187,49 @@ This is an automated message generated for asset protection purposes.
             "target_url": target_url,
             "contact_email": contact_email,
             "confidence": best_match.similarity_score,
+            "sent_at": datetime.utcnow().isoformat(),
+        }
+
+    async def trigger_for_report(
+        self, submission: TakedownReportRequest, user_id: str
+    ) -> dict:
+        if not submission.declaration_accepted:
+            raise ValueError("Declaration must be accepted before submitting a report")
+
+        if submission.final_score < 80:
+            raise ValueError("Report submission requires a final score of at least 80%")
+
+        target_url = submission.target_url.strip()
+        domain = self._get_domain(target_url)
+        if not domain:
+            raise ValueError("A valid target URL is required for takedown")
+
+        contact_email = (submission.contact_email or "").strip() or None
+        if not contact_email:
+            contact_results = self._search_contact(domain)
+            emails = self._extract_emails(contact_results)
+            contact_email = self._pick_best_email(emails)
+
+        if not contact_email:
+            raise ValueError("No contact email found for the matched domain")
+
+        confidence = self._normalize_confidence(submission.final_score)
+        subject = "Takedown Request: Potential Unauthorized Image Usage"
+        body = self._build_report_email_body(submission, target_url, confidence)
+
+        self._send_email_message(
+            to_email=contact_email,
+            subject=subject,
+            body=body,
+        )
+
+        return {
+            "status": "sent",
+            "asset_id": submission.asset_id,
+            "target_url": target_url,
+            "contact_email": contact_email,
+            "confidence": confidence,
+            "reporter_user_id": submission.reporter_user_id or user_id,
             "sent_at": datetime.utcnow().isoformat(),
         }
 

@@ -5,7 +5,10 @@ import torch
 # Load model
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+processor = BlipProcessor.from_pretrained(
+    "Salesforce/blip-image-captioning-base",
+    backend="pil",
+)
 model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to(device)
 
 

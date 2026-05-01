@@ -1,7 +1,8 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { motion, AnimatePresence } from 'motion/react';
-import type { Variants } from 'motion/react';
+import React, { forwardRef, useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { motion, AnimatePresence, useSpring, useTransform } from 'motion/react';
+import type { PanInfo, Variants } from 'motion/react';
 import * as THREE from 'three';
+import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { EtheralShadow } from '@/components/ui/etheral-shadow';
 import { FallingPattern } from '@/components/ui/falling-pattern';
@@ -42,13 +43,15 @@ import {
   SkipForward,
   Eye,
   Copy,
-  Check
+  Check,
+  SendHorizontal
 } from 'lucide-react';
 
 const PUBLISHABLE_KEY = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY || '';
 const INACTIVITY_TIMEOUT_MS = 10 * 60 * 1000;
 const SESSION_ACTIVITY_KEY = 'trinetra_last_activity_at';
 const FORCE_CLERK_SIGNOUT_KEY = 'trinetra_force_clerk_signout';
+const BOOT_MIN_DURATION_MS = 5000;
 
 // --- Types ---
 type AppState = 'BOOT' | 'AUTH' | 'DASHBOARD' | 'HISTORY' | 'INTELLIGENCE' | 'PROTECT' | 'SCAN' | 'METADATA';
@@ -67,7 +70,7 @@ type PipelineStep =
   | 'FINAL_OUTPUT';
 
 type PipelineStatus = 'idle' | 'running' | 'paused' | 'complete' | 'error';
-type VerdictType = 'Authentic' | 'Manipulated' | 'Suspicious' | 'Match Found' | 'Error' | null;
+type VerdictType = 'Authentic' | 'Manipulated' | 'Suspicious' | 'Match Found' | 'NO EXTERNAL MATCH' | 'Error' | null;
 
 const sectionTransition: Variants = {
   initial: { opacity: 0, y: 18, filter: 'blur(10px)' },
@@ -94,6 +97,7 @@ const sectionTransition: Variants = {
 interface PipelineData {
   image?: File;
   imagePreview?: string;
+  dashboardAssetId?: string;
   clipEmbeddings?: number[];
   blipCaptions?: string[];
   blipCaption?: string;
@@ -122,6 +126,12 @@ interface PipelineData {
   matchedImageUrl?: string;
   matchedImageLabel?: string;
   matchedImageSource?: string;
+  matchedMediaId?: string;
+  matchedPhash?: string;
+  webSearchAttempted?: boolean;
+  decisionExplanation?: string;
+  decisionAction?: string;
+  fraudLikelihood?: string;
 }
 
 interface PipelineState {
@@ -135,15 +145,48 @@ interface PipelineState {
 interface VeridexResult {
   filename: string;
   engine: string;
-  task: string;
+  task?: string;
   label: string;
+  prediction: 'AI' | 'REAL';
+  display_label: string;
   ai_probability: number;
   real_probability: number;
+  confidence_score: number;
   threshold: number;
   model: string;
   weights: string;
   raw_score: number;
+  component_scores?: {
+    cnn: number;
+    xgb: number;
+    cnn_real?: number;
+    feature_vector?: number[];
+  };
 }
+
+interface VeridexFeedbackJob {
+  job_id: string;
+  status: 'queued' | 'storing' | 'training' | 'cleaning' | 'completed' | 'failed';
+  stage: 'queued' | 'storing' | 'training' | 'cleaning' | 'completed' | 'failed';
+  prediction: 'AI' | 'REAL';
+  user_feedback: 'AI' | 'REAL';
+  error?: string | null;
+  completed_at?: string | null;
+}
+
+type IntelligenceWorkflowState =
+  | 'IDLE'
+  | 'ANALYZING'
+  | 'RESULT_VISIBLE'
+  | 'FEEDBACK_OPEN'
+  | 'TRAINING'
+  | 'TRAINING_SUCCESS'
+  | 'ANALYSIS_ERROR'
+  | 'TRAINING_ERROR';
+
+const RESULT_DISPLAY_HOLD_MS = 5000;
+const FEEDBACK_JOB_POLL_MS = 1200;
+const TRAINING_SUCCESS_HOLD_MS = 1800;
 
 const PIPELINE_STEPS: { id: PipelineStep; label: string; icon: any }[] = [
   { id: 'INPUT_IMAGE', label: 'Input Image', icon: UploadCloud },
@@ -166,6 +209,221 @@ const Reticle = () => (
     <div className="absolute top-0 right-0 w-4 h-4 border-t border-r border-primary" />
     <div className="absolute bottom-0 left-0 w-4 h-4 border-b border-l border-primary" />
     <div className="absolute bottom-0 right-0 w-4 h-4 border-b border-r border-primary" />
+  </div>
+);
+
+const SLIDE_DRAG_CONSTRAINTS = { left: 0, right: 154 };
+const SLIDE_DRAG_THRESHOLD = 0.9;
+const SLIDE_SPRING = {
+  stiffness: 520,
+  damping: 34,
+  mass: 0.45,
+};
+
+type SlideSubmitButtonProps = {
+  disabled?: boolean;
+  idleLabel?: string;
+  onSubmit: () => Promise<boolean>;
+  onSuccess?: () => void;
+  className?: string;
+};
+
+const SlideSubmitButton = forwardRef<HTMLButtonElement, SlideSubmitButtonProps>(
+  ({ className, disabled, idleLabel = 'Slide to Submit', onSubmit, onSuccess, ...props }, ref) => {
+    const [isDragging, setIsDragging] = useState(false);
+    const [completed, setCompleted] = useState(false);
+    const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
+
+    const handleX = useSpring(0, SLIDE_SPRING);
+    const dragProgress = useTransform(() => handleX.get() / SLIDE_DRAG_CONSTRAINTS.right);
+    const fillWidth = useTransform(() => handleX.get() + 44);
+    const labelOpacity = useTransform(() => Math.max(0.18, 1 - dragProgress.get() * 0.92));
+    const sheenOpacity = useTransform(() => Math.min(0.9, 0.18 + dragProgress.get() * 0.65));
+
+    const resetSlider = useCallback(() => {
+      setCompleted(false);
+      setStatus('idle');
+      setIsDragging(false);
+      handleX.set(0);
+    }, [handleX]);
+
+    const handleDragStart = useCallback(() => {
+      if (disabled || completed) return;
+      setIsDragging(true);
+    }, [completed, disabled]);
+
+    const handleDrag = useCallback((
+      _event: MouseEvent | TouchEvent | PointerEvent,
+      info: PanInfo,
+    ) => {
+      if (disabled || completed) return;
+      const newX = Math.max(0, Math.min(info.offset.x, SLIDE_DRAG_CONSTRAINTS.right));
+      handleX.set(newX);
+    }, [completed, disabled, handleX]);
+
+    const handleDragEnd = useCallback(async () => {
+      if (disabled || completed) return;
+      setIsDragging(false);
+
+      if (dragProgress.get() < SLIDE_DRAG_THRESHOLD) {
+        handleX.set(0);
+        return;
+      }
+
+      handleX.set(SLIDE_DRAG_CONSTRAINTS.right);
+      setCompleted(true);
+      setStatus('loading');
+      const succeeded = await onSubmit();
+
+      if (succeeded) {
+        setStatus('success');
+        window.setTimeout(() => {
+          onSuccess?.();
+        }, 700);
+        return;
+      }
+
+      setStatus('error');
+      window.setTimeout(() => {
+        resetSlider();
+      }, 1000);
+    }, [completed, disabled, dragProgress, handleX, onSubmit, onSuccess, resetSlider]);
+
+    return (
+      <motion.div
+        animate={{ width: completed ? '8rem' : '13rem' }}
+        transition={{ type: 'spring', ...SLIDE_SPRING }}
+        className={cn(
+          'relative flex h-10 items-center justify-center overflow-hidden rounded-full border border-error/30 bg-surface-container-lowest shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]',
+          disabled && 'opacity-50',
+        )}
+      >
+        {!completed && (
+          <>
+            <motion.div
+              style={{ width: fillWidth }}
+              className="absolute inset-y-0 left-0 rounded-full bg-[linear-gradient(90deg,#8f1411_0%,#b3261e_55%,#d74235_100%)]"
+            />
+            <motion.div
+              style={{ opacity: sheenOpacity }}
+              className="absolute inset-y-[1px] left-[1px] right-[1px] rounded-full bg-[linear-gradient(120deg,rgba(255,255,255,0.18),transparent_30%,transparent_70%,rgba(255,255,255,0.14))]"
+            />
+            <motion.span
+              style={{ opacity: labelOpacity }}
+              className="relative z-[1] pl-10 pr-4 font-mono text-[10px] uppercase tracking-[0.24em] text-on-surface"
+            >
+              {disabled ? 'Complete Required Fields' : idleLabel}
+            </motion.span>
+          </>
+        )}
+
+        {!completed && (
+          <motion.div
+            drag={disabled ? false : 'x'}
+            dragConstraints={SLIDE_DRAG_CONSTRAINTS}
+            dragElastic={0.02}
+            dragMomentum={false}
+            dragTransition={{ bounceStiffness: 900, bounceDamping: 40, power: 0.05, timeConstant: 120 }}
+            onDragStart={handleDragStart}
+            onDrag={handleDrag}
+            onDragEnd={() => { void handleDragEnd(); }}
+            style={{ x: handleX }}
+            whileTap={{ scale: 1.03 }}
+            className="absolute left-0 z-10 flex items-center justify-start px-1 will-change-transform"
+          >
+            <button
+              ref={ref}
+              {...props}
+              type="button"
+              disabled={disabled || status === 'loading'}
+              className={cn(
+                'flex h-8 w-8 items-center justify-center rounded-full border border-white/20 bg-white text-[#8f1411] shadow-[0_8px_20px_rgba(0,0,0,0.28)] transition-transform duration-150',
+                isDragging && 'scale-[1.04]',
+                className,
+              )}
+            >
+              <SendHorizontal className="size-4" />
+            </button>
+          </motion.div>
+        )}
+
+        {completed && (
+          <motion.div
+            className="absolute inset-0 flex items-center justify-center"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+          >
+            <button
+              ref={ref}
+              {...props}
+              type="button"
+              disabled
+              className={cn(
+                'h-full w-full rounded-full border border-error/40 bg-[#b3261e] text-white',
+                className,
+              )}
+            >
+              <AnimatePresence mode="wait">
+                <motion.div
+                  key={status}
+                  initial={{ opacity: 0, scale: 0.5 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0 }}
+                >
+                  {status === 'loading' ? (
+                    <Loader2 className="animate-spin" size={20} />
+                  ) : status === 'success' ? (
+                    <Check size={20} />
+                  ) : status === 'error' ? (
+                    <X size={20} />
+                  ) : null}
+                </motion.div>
+              </AnimatePresence>
+            </button>
+          </motion.div>
+        )}
+      </motion.div>
+    );
+  },
+);
+
+SlideSubmitButton.displayName = 'SlideSubmitButton';
+
+const GuestRestrictionModal = ({
+  feature,
+  onClose,
+}: {
+  feature: string;
+  onClose: () => void;
+}) => (
+  <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+    <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={onClose} />
+    <motion.div
+      initial={{ opacity: 0, y: 16, scale: 0.98 }}
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      className="relative w-full max-w-md bg-surface-container border border-error/30 shadow-2xl"
+    >
+      <div className="p-6 space-y-5">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 bg-error/10 border border-error/30 flex items-center justify-center text-error">
+            <AlertTriangle className="w-5 h-5" />
+          </div>
+          <div>
+            <h3 className="font-mono text-sm font-bold uppercase tracking-widest">{feature}</h3>
+            <p className="font-mono text-[10px] text-outline uppercase">Guest mode restriction</p>
+          </div>
+        </div>
+        <div className="border border-error/30 bg-error/10 p-4 font-mono text-xs text-error">
+          This feature should be used by the Signed Up users. Please sign up to continue.
+        </div>
+      </div>
+      <div className="p-5 border-t border-outline-variant flex justify-end">
+        <Button variant="primary" onClick={onClose}>
+          Close
+        </Button>
+      </div>
+    </motion.div>
   </div>
 );
 
@@ -334,9 +592,41 @@ interface StageViewProps {
   data?: PipelineData;
   onNext?: () => void;
   onRetry?: () => void;
-  onOverride?: () => void;
   isProcessing?: boolean;
 }
+
+const PipelineErrorView: React.FC<{
+  message?: string;
+  onRetry?: () => void;
+  onReset?: () => void;
+}> = ({ message, onRetry, onReset }) => (
+  <div className="p-6">
+    <div className="border border-error bg-error/10 p-6 lg:p-8 space-y-5">
+      <div className="flex items-start gap-4">
+        <div className="flex h-14 w-14 items-center justify-center rounded-full border border-error/60 bg-error/10">
+          <AlertTriangle className="h-7 w-7 text-error" />
+        </div>
+        <div className="space-y-2">
+          <h3 className="font-mono text-xl font-bold uppercase tracking-widest text-error">Pipeline Error</h3>
+          <p className="font-mono text-[11px] uppercase text-outline">
+            The scan could not move past the current stage.
+          </p>
+          <p className="font-mono text-xs text-on-surface-variant leading-relaxed">
+            {message || 'The analysis request failed before the next pipeline stage could begin.'}
+          </p>
+        </div>
+      </div>
+      <div className="flex flex-wrap gap-3 pt-2 border-t border-error/30">
+        <Button variant="primary" onClick={onRetry}>
+          <RefreshCw className="w-4 h-4 mr-2" /> Retry Scan
+        </Button>
+        <Button variant="secondary" onClick={onReset}>
+          <ChevronLeft className="w-4 h-4 mr-2" /> Back To Input
+        </Button>
+      </div>
+    </div>
+  </div>
+);
 
 const InputImageView: React.FC<StageViewProps & { onFileSelect: (file: File, preview: string) => void }> = ({
   data,
@@ -864,7 +1154,12 @@ interface WebCandidate {
 
 type WebSearchPhase = 'discovery' | 'validation' | 'focus-lock';
 
-const WEB_SEARCH_DURATION_MS = 20000;
+const WEB_SEARCH_DURATION_MS = 5200;
+const FEATURE_EXTRACTION_MIN_MS = 1800;
+const STAGE_TRANSITION_FAST_MS = 700;
+const STAGE_TRANSITION_MEDIUM_MS = 1050;
+const STAGE_TRANSITION_SLOW_MS = 1450;
+const FETCH_TIMEOUT_MS = 120000;
 
 const WEB_DOMAINS = [
   'lens.google',
@@ -895,7 +1190,9 @@ const WEB_DOMAINS = [
 ];
 
 const buildWebCandidates = (data?: PipelineData): WebCandidate[] => {
-  const resultScore = Number(data?.webSearchResults?.[0]?.similarity || 0) * 100 || Number(data?.clipSimilarity || 86);
+  const resultScore = data?.verdict === 'NO EXTERNAL MATCH'
+    ? 0
+    : Number(data?.webSearchResults?.[0]?.similarity || 0) * 100 || Number(data?.clipSimilarity || 86);
   const validIndexes = new Set([3, 7, 11, 16, 21]);
   const selectedIndex = 11;
 
@@ -1329,49 +1626,76 @@ const WebSearchView: React.FC<StageViewProps> = ({ data, isProcessing }) => {
   );
 };
 
-const SimilarityMatchingView: React.FC<StageViewProps> = ({ data }) => {
-  return (
-    <div className="p-6 space-y-4">
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <div className="bg-surface-container border border-outline-variant p-4 space-y-3">
-          <div className="flex items-center gap-2">
-            <Brain className="w-4 h-4 text-primary" />
-            <span className="font-mono text-xs uppercase">CLIP Similarity</span>
-          </div>
-          <div className="flex items-end gap-2">
-            <span className="font-mono text-3xl font-bold text-primary">
-              {data.clipSimilarity?.toFixed(1) || '--'}%
-            </span>
-            <span className="font-mono text-[10px] text-outline mb-1">similarity</span>
-          </div>
-          <div className="w-full h-2 bg-surface-container-highest">
-            <motion.div
-              className="h-full bg-primary"
-              initial={{ width: 0 }}
-              animate={{ width: `${data.clipSimilarity || 0}%` }}
-            />
-          </div>
-        </div>
+const SimilarityMatchingView: React.FC<StageViewProps> = ({ data, isProcessing }) => {
+  const clipSimilarity = Math.max(0, Math.min(100, Number(data?.clipSimilarity || 0)));
+  const pHashSimilarity = Math.max(0, Math.min(100, Number(data?.pHashSimilarity || 0)));
 
-        <div className="bg-surface-container border border-outline-variant p-4 space-y-3">
-          <div className="flex items-center gap-2">
-            <ImageIcon className="w-4 h-4 text-tertiary" />
-            <span className="font-mono text-xs uppercase">Pixel/pHash Match</span>
-          </div>
-          <div className="flex items-end gap-2">
-            <span className="font-mono text-3xl font-bold text-tertiary">
-              {data.pHashSimilarity?.toFixed(1) || '--'}%
-            </span>
-            <span className="font-mono text-[10px] text-outline mb-1">similarity</span>
-          </div>
-          <div className="w-full h-2 bg-surface-container-highest">
-            <motion.div
-              className="h-full bg-tertiary"
-              initial={{ width: 0 }}
-              animate={{ width: `${data.pHashSimilarity || 0}%` }}
-            />
-          </div>
-        </div>
+  const metricCards = [
+    {
+      id: 'clip',
+      label: 'CLIP Similarity',
+      icon: Brain,
+      value: clipSimilarity,
+      barTone: 'bg-primary',
+      valueTone: 'text-primary',
+      statusCopy: isProcessing ? 'Semantic vector alignment in progress' : 'Semantic embedding comparison complete',
+    },
+    {
+      id: 'phash',
+      label: 'Pixel/pHash Match',
+      icon: ImageIcon,
+      value: pHashSimilarity,
+      barTone: 'bg-tertiary',
+      valueTone: 'text-tertiary',
+      statusCopy: isProcessing ? 'Pixel signature correlation in progress' : 'Perceptual hash comparison complete',
+    },
+  ];
+
+  return (
+    <div className="p-6">
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+        {metricCards.map((card) => {
+          const IconComponent = card.icon;
+          return (
+            <div
+              key={card.id}
+              className="bg-surface-container border border-outline-variant p-5 lg:p-6 min-h-[170px] flex flex-col justify-between"
+            >
+              <div className="flex items-center gap-2">
+                <IconComponent className={`w-4 h-4 ${card.valueTone}`} />
+                <span className="font-mono text-xs uppercase tracking-widest">{card.label}</span>
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex items-end gap-2">
+                  <span className={`font-mono text-5xl leading-none font-bold ${card.valueTone}`}>
+                    {card.value.toFixed(1)}%
+                  </span>
+                  <span className="font-mono text-[10px] uppercase text-outline mb-1">similarity</span>
+                </div>
+                <p className="font-mono text-[10px] uppercase text-outline">
+                  {card.statusCopy}
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                <div className="w-full h-3 border border-outline-variant bg-surface-container-highest">
+                  <motion.div
+                    className={`h-full ${card.barTone}`}
+                    initial={{ width: 0 }}
+                    animate={{ width: `${card.value}%` }}
+                    transition={{ duration: 0.55, ease: 'easeOut' }}
+                  />
+                </div>
+                <div className="flex items-center justify-between font-mono text-[9px] uppercase text-outline">
+                  <span>0%</span>
+                  <span>{card.value.toFixed(1)}% confidence</span>
+                  <span>100%</span>
+                </div>
+              </div>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -1424,9 +1748,58 @@ interface MatchResult {
   action: string;
   explanation: string;
   source?: string;
+  matchedMediaId?: string;
   matchedImageUrl?: string;
   matchedImageLabel?: string;
 }
+
+interface ReportFormState {
+  reporterName: string;
+  reporterEmail: string;
+  reporterUserId: string;
+  accountJoinedSince: string;
+  rightsHolder: string;
+  assetId: string;
+  assetFilename: string;
+  assetMimeType: string;
+  assetSizeLabel: string;
+  assetSizeBytes: number;
+  verdict: string;
+  finalScore: number;
+  matchedReference: string;
+  matchedSource: string;
+  targetUrl: string;
+  contactEmail: string;
+  issueSummary: string;
+  notes: string;
+  declarationAccepted: boolean;
+}
+
+const resolveMatchedAssetPreview = async (matchedMediaId?: string): Promise<string | undefined> => {
+  if (!matchedMediaId) {
+    return undefined;
+  }
+
+  const token = localStorage.getItem('trinetra_access_token') || localStorage.getItem('authToken');
+  if (!token) {
+    return undefined;
+  }
+
+  try {
+    const response = await fetch(`/api/dashboard/assets/${matchedMediaId}/preview`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      return undefined;
+    }
+    return typeof payload.preview_url === 'string' ? payload.preview_url : undefined;
+  } catch {
+    return undefined;
+  }
+};
 
 const MatchResultCard: React.FC<{ result: MatchResult; blipCaption?: string }> = ({ result, blipCaption }) => {
   const getLabelStyle = (label: string) => {
@@ -1458,7 +1831,7 @@ const MatchResultCard: React.FC<{ result: MatchResult; blipCaption?: string }> =
   };
 
   return (
-    <div className="bg-surface-container border border-outline-variant p-4 space-y-3">
+    <div className="bg-surface-container border border-outline-variant p-4 lg:p-5 space-y-4 min-h-[336px] flex flex-col">
       <div className="flex items-center justify-between">
         <span className={`font-mono text-xs font-bold uppercase px-2 py-1 border ${getLabelStyle(result.label)}`}>
           {result.label}
@@ -1468,7 +1841,7 @@ const MatchResultCard: React.FC<{ result: MatchResult; blipCaption?: string }> =
         </span>
       </div>
 
-      <div className="space-y-2">
+      <div className="space-y-3">
         <div className="flex justify-between items-center">
           <span className="font-mono text-[10px] text-outline">FINAL SCORE</span>
           <span className={`font-mono text-lg font-bold ${
@@ -1484,7 +1857,7 @@ const MatchResultCard: React.FC<{ result: MatchResult; blipCaption?: string }> =
               <span>CLIP</span>
               <span>{(result.clipScore * 100).toFixed(1)}%</span>
             </div>
-            <div className="w-full h-1.5 bg-surface-container-highest">
+            <div className="w-full h-2 bg-surface-container-highest">
               <motion.div
                 className="h-full bg-primary"
                 initial={{ width: 0 }}
@@ -1498,7 +1871,7 @@ const MatchResultCard: React.FC<{ result: MatchResult; blipCaption?: string }> =
               <span>pHash</span>
               <span>{(result.phashScore * 100).toFixed(1)}%</span>
             </div>
-            <div className="w-full h-1.5 bg-surface-container-highest">
+            <div className="w-full h-2 bg-surface-container-highest">
               <motion.div
                 className="h-full bg-tertiary"
                 initial={{ width: 0 }}
@@ -1522,7 +1895,7 @@ const MatchResultCard: React.FC<{ result: MatchResult; blipCaption?: string }> =
         </div>
       )}
 
-      <div className="bg-surface-container-lowest border border-outline-variant p-3 space-y-2">
+      <div className="bg-surface-container-lowest border border-outline-variant p-3 space-y-2 mt-auto">
         <div className="flex justify-between">
           <span className="font-mono text-[9px] text-outline">RISK LEVEL</span>
           <span className={`font-mono text-xs font-bold ${
@@ -1631,69 +2004,76 @@ const FinalOutputView: React.FC<{
   blipCaption?: string;
   uploadedImageAnalysis?: PipelineData['uploadedImageAnalysis'];
   onNext?: () => void;
-  onOverride?: () => void;
+  onReport?: () => void;
   onViewComparison?: () => void;
   onExportReport?: () => void;
   onProtect?: () => void;
-}> = ({ verdict, matchResult, comparisonImage, inputImageUrl, blipCaption, uploadedImageAnalysis, onNext, onOverride, onViewComparison, onExportReport, onProtect }) => {
-  const getVerdictColor = (v: VerdictType) => {
-    switch (v) {
-      case 'Match Found':
-      case 'Manipulated': return 'border-error bg-error/10 text-error';
-      case 'Suspicious': return 'border-tertiary bg-tertiary/10 text-tertiary';
-      default: return 'border-primary bg-primary/10 text-primary';
-    }
-  };
-
-  const getVerdictIcon = (v: VerdictType) => {
-    switch (v) {
-      case 'Match Found':
-      case 'Manipulated': return XCircle;
-      case 'Suspicious': return AlertTriangle;
-      default: return CheckCircle2;
-    }
-  };
-
-  const Icon = getVerdictIcon(verdict);
+}> = ({ verdict, matchResult, comparisonImage, inputImageUrl, blipCaption, uploadedImageAnalysis, onNext, onReport, onViewComparison, onExportReport, onProtect }) => {
+  const effectiveLabel = (matchResult?.label || verdict || 'Pending').toString().toUpperCase();
+  const isHighRiskLabel = ['MATCH FOUND', 'EXACT MATCH', 'MANIPULATED', 'CROPPED FRAUD'].includes(effectiveLabel);
+  const isWarningLabel = ['SUSPICIOUS', 'WEAK'].includes(effectiveLabel);
+  const bannerTone = isHighRiskLabel
+    ? 'border-error/70 bg-[linear-gradient(90deg,rgba(255,138,128,0.10),rgba(255,138,128,0.03))] text-error'
+    : isWarningLabel
+    ? 'border-tertiary/70 bg-[linear-gradient(90deg,rgba(246,187,133,0.12),rgba(246,187,133,0.03))] text-tertiary'
+    : 'border-primary/70 bg-[linear-gradient(90deg,rgba(152,207,227,0.12),rgba(152,207,227,0.03))] text-primary';
+  const bannerSummary =
+    effectiveLabel === 'NO EXTERNAL MATCH'
+      ? 'Web search completed without a reliable external match.'
+      : effectiveLabel === 'PARTIAL MATCH'
+      ? 'Moderate match - manual review recommended'
+      : effectiveLabel === 'STRONG MATCH'
+      ? 'Strong match detected - escalation recommended'
+      : effectiveLabel === 'MATCH FOUND' || effectiveLabel === 'EXACT MATCH'
+      ? 'High confidence local registry match detected'
+      : effectiveLabel === 'CROPPED FRAUD'
+      ? 'Possible cropped or transformed misuse detected'
+      : effectiveLabel === 'SUSPICIOUS'
+      ? 'Suspicious similarity signal detected during analysis'
+      : 'Pipeline completed with the strongest available evidence.';
+  const Icon = isHighRiskLabel ? XCircle : isWarningLabel ? AlertTriangle : CheckCircle2;
+  const matchedReferenceHeading =
+    matchResult?.source === 'local_db'
+      ? 'Matched Local DB Image'
+      : 'Matched Reference';
+  const inputLabel = uploadedImageAnalysis?.filename || 'source_image.jpg';
+  const matchedLabel = matchResult?.matchedImageLabel || matchResult?.source || 'reference_match.jpg';
+  const canOpenComparison = Boolean(comparisonImage || matchResult?.matchedImageUrl);
+  const canReport = (matchResult?.score || 0) >= 80;
 
   return (
     <div className="h-full overflow-y-auto custom-scrollbar">
       <div className="p-6 space-y-6">
-        {/* Verdict Banner */}
         <motion.div
           initial={{ opacity: 0, y: -20 }}
           animate={{ opacity: 1, y: 0 }}
-          className={`p-6 border-2 ${getVerdictColor(verdict)}`}
+          className={`border-2 p-6 lg:p-7 ${bannerTone}`}
         >
           <div className="flex items-center gap-4">
-            <Icon className="w-12 h-12" />
+            <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-full border border-current/50 bg-black/15">
+              <Icon className="w-10 h-10" />
+            </div>
             <div>
               <h2 className="font-mono text-xl font-bold uppercase tracking-widest">
-                {verdict || 'Pending'}
+                {effectiveLabel}
               </h2>
-              <p className="font-mono text-[10px] text-outline mt-1">
-                {verdict === 'Authentic'
-                  ? 'No significant matches found - image appears original'
-                  : verdict === 'Manipulated'
-                  ? 'High confidence match - potential unauthorized use detected'
-                  : 'Moderate match - manual review recommended'}
+              <p className="font-mono text-[10px] uppercase text-outline mt-2">
+                {bannerSummary}
               </p>
             </div>
           </div>
         </motion.div>
 
-        {/* Match Result Card */}
         {matchResult && (
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <div className="grid grid-cols-1 xl:grid-cols-[1.02fr_1.08fr] gap-6">
             <MatchResultCard result={matchResult} blipCaption={blipCaption} />
 
-            {/* Comparison Preview */}
-            <div className="bg-surface-container border border-outline-variant p-4 space-y-3">
-              <div className="flex items-center justify-between">
-                <span className="font-mono text-xs uppercase text-primary">Visual Comparison</span>
+            <div className="bg-surface-container border border-outline-variant p-4 lg:p-5 space-y-4 min-h-[336px]">
+              <div className="flex items-center justify-between border-b border-outline-variant pb-2">
+                <span className="font-mono text-xs uppercase tracking-widest text-primary">Visual Comparison</span>
               </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div className="aspect-video bg-surface-container-highest border border-outline-variant flex items-center justify-center overflow-hidden">
+                <div className="aspect-[16/10] bg-surface-container-highest border border-outline-variant flex items-center justify-center overflow-hidden">
                   {inputImageUrl ? (
                     <img src={inputImageUrl} alt="Input preview" className="w-full h-full object-contain" />
                   ) : (
@@ -1703,9 +2083,9 @@ const FinalOutputView: React.FC<{
                     </div>
                   )}
                 </div>
-                <div className="aspect-video bg-surface-container-highest border border-outline-variant flex items-center justify-center overflow-hidden">
+                <div className="aspect-[16/10] bg-surface-container-highest border border-outline-variant flex items-center justify-center overflow-hidden">
                   {matchResult?.matchedImageUrl ? (
-                    <img src={matchResult.matchedImageUrl} alt={matchResult.matchedImageLabel || 'Matched local DB image'} className="w-full h-full object-contain" />
+                    <img src={matchResult.matchedImageUrl} alt={matchResult.matchedImageLabel || 'Matched reference image'} className="w-full h-full object-contain" />
                   ) : comparisonImage ? (
                     <img src={comparisonImage} alt="Comparison preview" className="w-full h-full object-contain" />
                   ) : (
@@ -1719,11 +2099,11 @@ const FinalOutputView: React.FC<{
               <div className="grid grid-cols-2 gap-2 text-[9px] font-mono">
                 <div className="bg-surface-container-lowest p-2 border border-outline-variant">
                   <p className="text-outline">INPUT</p>
-                  <p className="text-on-surface truncate">source_image.jpg</p>
+                  <p className="text-on-surface truncate">{inputLabel}</p>
                 </div>
                 <div className="bg-surface-container-lowest p-2 border border-outline-variant">
-                  <p className="text-outline">MATCHED LOCAL DB IMAGE</p>
-                  <p className="text-on-surface truncate">{matchResult.matchedImageLabel || matchResult.source || 'database_ref.jpg'}</p>
+                  <p className="text-outline uppercase">{matchedReferenceHeading}</p>
+                  <p className="text-on-surface truncate" title={matchedLabel}>{matchedLabel}</p>
                 </div>
               </div>
             </div>
@@ -1731,10 +2111,10 @@ const FinalOutputView: React.FC<{
         )}
 
         {uploadedImageAnalysis && (
-          <div className="bg-surface-container border border-outline-variant p-4 space-y-4">
-            <div className="flex items-center gap-2 border-b border-outline-variant pb-2">
+          <div className="bg-surface-container border border-outline-variant p-4 lg:p-5 space-y-5">
+            <div className="flex items-center gap-2 border-b border-outline-variant pb-3">
               <Fingerprint className="w-4 h-4 text-primary" />
-              <span className="font-mono text-xs uppercase text-primary">Uploaded Image Analysis</span>
+              <span className="font-mono text-xs uppercase tracking-widest text-primary">Uploaded Image Analysis</span>
             </div>
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 font-mono text-[10px]">
               <div className="bg-surface-container-lowest border border-outline-variant p-3 space-y-1">
@@ -1750,9 +2130,9 @@ const FinalOutputView: React.FC<{
                 <p className="text-on-surface">{uploadedImageAnalysis.embedding?.type || 'full_image'} / {uploadedImageAnalysis.embedding?.dimensions || 0}</p>
               </div>
             </div>
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              <div className="bg-surface-container-lowest border border-outline-variant p-3 space-y-2">
-                <p className="font-mono text-[10px] text-outline uppercase">Generated Captions</p>
+            <div className="grid grid-cols-1 lg:grid-cols-[1.05fr_1fr] gap-4">
+              <div className="bg-surface-container-lowest border border-outline-variant p-3 space-y-3 min-h-[276px]">
+                <p className="font-mono text-[10px] text-outline uppercase tracking-widest">Generated Captions</p>
                 <div className="space-y-2">
                   {(uploadedImageAnalysis.captions || []).length > 0 ? (
                     uploadedImageAnalysis.captions?.map((caption, index) => (
@@ -1766,9 +2146,9 @@ const FinalOutputView: React.FC<{
                   )}
                 </div>
               </div>
-              <div className="bg-surface-container-lowest border border-outline-variant p-3 space-y-2">
-                <p className="font-mono text-[10px] text-outline uppercase">Embedding Preview</p>
-                <pre className="max-h-48 overflow-y-auto custom-scrollbar whitespace-pre-wrap text-[10px] text-on-surface-variant bg-black/30 border border-outline-variant p-3">
+              <div className="bg-surface-container-lowest border border-outline-variant p-3 space-y-3 min-h-[276px]">
+                <p className="font-mono text-[10px] text-outline uppercase tracking-widest">Embedding Preview</p>
+                <pre className="h-[216px] overflow-y-auto custom-scrollbar whitespace-pre-wrap text-[10px] text-on-surface-variant bg-black/30 border border-outline-variant p-3">
 {JSON.stringify({
   dimensions: uploadedImageAnalysis.embedding?.dimensions || 0,
   vector_preview: uploadedImageAnalysis.embedding?.preview || uploadedImageAnalysis.embedding?.vector?.slice(0, 16) || [],
@@ -1779,18 +2159,19 @@ const FinalOutputView: React.FC<{
           </div>
         )}
 
-        {/* Action Buttons */}
         <div className="flex flex-wrap gap-4 pt-4 border-t border-outline-variant">
-          <Button variant="secondary" onClick={onOverride}>
-            <RefreshCw className="w-4 h-4 mr-2" /> Override
-          </Button>
+          {canReport && (
+            <Button variant="danger" onClick={onReport}>
+              <AlertTriangle className="w-4 h-4 mr-2" /> Report
+            </Button>
+          )}
           <Button variant="primary" onClick={onExportReport}>
             <Download className="w-4 h-4 mr-2" /> Export Report
           </Button>
           <Button variant="outline" onClick={onProtect}>
             <Shield className="w-4 h-4 mr-2" /> Protect Asset
           </Button>
-          {comparisonImage && (
+          {canOpenComparison && (
             <Button variant="outline" onClick={onViewComparison}>
               <Eye className="w-4 h-4 mr-2" /> View Comparison
             </Button>
@@ -2002,15 +2383,23 @@ const LegacyAuthScreen = ({ onLogin }: { onLogin: () => void }) => {
 };
 
 const BootScreen = ({ onComplete }: { onComplete: () => void }) => {
+  const [frameLoadedAt, setFrameLoadedAt] = useState<number | null>(null);
+
   useEffect(() => {
+    if (frameLoadedAt === null) {
+      return;
+    }
+
+    const elapsed = Date.now() - frameLoadedAt;
+    const remaining = Math.max(0, BOOT_MIN_DURATION_MS - elapsed);
     const bootTimer = window.setTimeout(() => {
       onComplete();
-    }, 9000);
+    }, remaining);
 
     return () => {
       window.clearTimeout(bootTimer);
     };
-  }, [onComplete]);
+  }, [frameLoadedAt, onComplete]);
 
   return (
     <motion.div
@@ -2022,6 +2411,7 @@ const BootScreen = ({ onComplete }: { onComplete: () => void }) => {
         src="/frontend/loading.html"
         title="Trinetra Loading Screen"
         className="h-full w-full border-0"
+        onLoad={() => setFrameLoadedAt(Date.now())}
       />
     </motion.div>
   );
@@ -2035,6 +2425,7 @@ interface DashboardAsset {
   phash: string;
   preview_url: string;
   is_local_only?: boolean;
+  is_registry_only?: boolean;
   protected_asset_id?: string | number;
   protected_owner?: string;
   protected_fingerprint?: string;
@@ -2105,9 +2496,13 @@ const ensureUserProfile = (email: string, joinedAt?: string | number): UserProfi
 
 const fetchWithStoredAuth = async (input: RequestInfo | URL, init: RequestInit = {}) => {
   const token = localStorage.getItem('trinetra_access_token');
+  const email = localStorage.getItem('trinetra_user_email');
   const headers = new Headers(init.headers || {});
   if (token) {
     headers.set('Authorization', `Bearer ${token}`);
+  }
+  if (email && email !== 'guest@local') {
+    headers.set('X-Trinetra-User-Email', email);
   }
   return fetch(input, { ...init, headers });
 };
@@ -2191,6 +2586,38 @@ const upsertProtectedAssetCache = (email: string, asset: DashboardAsset) => {
   writeProtectedAssetCache(email, next);
 };
 
+const resolveMatchedPreviewFromProtectedCache = (
+  matchedMediaId?: string,
+  matchedPhash?: string,
+): { previewUrl?: string; label?: string } => {
+  if (typeof window === 'undefined') {
+    return {};
+  }
+
+  const userEmail = localStorage.getItem('trinetra_user_email') || 'unknown';
+  const protectedAssets = readProtectedAssetCache(userEmail);
+  const matchedAsset = protectedAssets.find((asset) => {
+    const assetId = String(asset.id || '');
+    const protectedAssetId = String(asset.protected_asset_id || '');
+    const mediaId = String(matchedMediaId || '');
+    const phash = String(matchedPhash || '');
+
+    return (
+      (!!mediaId && mediaId !== '0' && (assetId === mediaId || protectedAssetId === mediaId)) ||
+      (!!phash && asset.phash === phash)
+    );
+  });
+
+  if (!matchedAsset?.preview_url) {
+    return {};
+  }
+
+  return {
+    previewUrl: matchedAsset.preview_url,
+    label: matchedAsset.filename,
+  };
+};
+
 const removeProtectedAssetCacheItem = (email: string, assetId: string) => {
   const existing = readProtectedAssetCache(email);
   const nextAssets = existing.filter((item) => item.id !== assetId);
@@ -2269,6 +2696,14 @@ const parseApiResponse = async <T,>(response: Response): Promise<T | null> => {
   }
 };
 
+const withCacheBusting = (url?: string) => {
+  if (!url) return undefined;
+  if (url.startsWith('data:') || url.startsWith('blob:')) {
+    return url;
+  }
+  return `${url}${url.includes('?') ? '&' : '?'}t=${Date.now()}`;
+};
+
 const linkAssetToDashboard = async (file: File) => {
   const assetFormData = new FormData();
   assetFormData.append('file', file);
@@ -2290,6 +2725,40 @@ const triggerAssetTakedown = async (assetId: string) => {
   const result = await parseApiResponse<{ detail?: string; contact_email?: string; target_url?: string }>(response);
   if (!response.ok) {
     throw new Error((result && 'detail' in result ? result.detail : undefined) || 'Failed to trigger takedown');
+  }
+  return result;
+};
+
+const submitScanReport = async (payload: {
+  reporter_name: string;
+  reporter_email: string;
+  reporter_user_id?: string;
+  account_joined_since?: string;
+  rights_holder: string;
+  asset_id?: string;
+  asset_filename: string;
+  asset_mime_type?: string;
+  asset_size_bytes?: number;
+  verdict?: string;
+  final_score: number;
+  matched_reference?: string;
+  matched_source?: string;
+  target_url: string;
+  contact_email?: string;
+  issue_summary: string;
+  notes?: string;
+  declaration_accepted: boolean;
+}) => {
+  const response = await fetchWithStoredAuth('/takedown/report', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  const result = await parseApiResponse<{ detail?: string; contact_email?: string; target_url?: string }>(response);
+  if (!response.ok) {
+    throw new Error((result && 'detail' in result ? result.detail : undefined) || 'Failed to submit report');
   }
   return result;
 };
@@ -2470,12 +2939,12 @@ const ResultsDashboard = () => {
         <header className="flex justify-between items-end border-b border-outline-variant pb-4">
           <div>
             <h1 className="font-mono text-2xl font-bold tracking-tight">ANALYSIS RESULTS</h1>
-            <p className="font-mono text-[11px] text-outline uppercase mt-1">Unavailable for guest session</p>
+            <p className="font-mono text-[11px] text-outline uppercase mt-1">Guest Mode</p>
           </div>
         </header>
         <div className="bg-surface-container border border-outline-variant p-8 space-y-3">
-          <p className="font-mono text-sm uppercase tracking-widest text-on-surface">Dashboard Unavailable</p>
-          <p className="font-mono text-[11px] text-outline uppercase">Sign in or sign up to view your assets, scans, and dashboard history.</p>
+          <p className="font-mono text-sm uppercase tracking-widest text-on-surface">No Data Available In Guest Mode</p>
+          <p className="font-mono text-[11px] text-outline uppercase">Please sign up to view dashboard assets and history.</p>
         </div>
       </div>
     );
@@ -2671,33 +3140,6 @@ const ResultsDashboard = () => {
               </div>
             )}
           </div>
-
-          <div className="pt-6 border-t border-outline-variant">
-            <h2 className="font-mono text-[10px] text-outline uppercase mb-4">User Summary</h2>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div className="bg-surface-container border border-outline-variant p-3 space-y-2">
-                <div className="flex items-center justify-between border-b border-outline-variant pb-1">
-                  <span className="font-mono text-[11px] font-bold">ASSETS</span>
-                  <span className="font-mono text-[10px] text-primary font-bold">{summary.total_assets || 0}</span>
-                </div>
-                <p className="font-mono text-[10px] text-on-surface-variant leading-relaxed">Total uploaded assets linked to the authenticated user account.</p>
-              </div>
-              <div className="bg-surface-container border border-outline-variant p-3 space-y-2">
-                <div className="flex items-center justify-between border-b border-outline-variant pb-1">
-                  <span className="font-mono text-[11px] font-bold">SCANS</span>
-                  <span className="font-mono text-[10px] text-primary font-bold">{summary.completed_scans || 0}</span>
-                </div>
-                <p className="font-mono text-[10px] text-on-surface-variant leading-relaxed">Completed scan jobs found across the current user&apos;s asset inventory.</p>
-              </div>
-              <div className="bg-surface-container border border-outline-variant p-3 space-y-2">
-                <div className="flex items-center justify-between border-b border-outline-variant pb-1">
-                  <span className="font-mono text-[11px] font-bold">MATCHES</span>
-                  <span className={`font-mono text-[10px] font-bold ${summary.total_matches ? 'text-tertiary' : 'text-outline'}`}>{summary.total_matches || 0}</span>
-                </div>
-                <p className="font-mono text-[10px] text-on-surface-variant leading-relaxed">Aggregate match count returned by completed scans for this logged-in user.</p>
-              </div>
-            </div>
-          </div>
         </div>
       </div>
     </div>
@@ -2708,15 +3150,86 @@ const IntelligenceScanning = () => {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [result, setResult] = useState<VeridexResult | null>(null);
+  const [workflowState, setWorkflowState] = useState<IntelligenceWorkflowState>('IDLE');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const [trainingJob, setTrainingJob] = useState<VeridexFeedbackJob | null>(null);
+  const [trainingError, setTrainingError] = useState<string | null>(null);
+  const isGuest = localStorage.getItem('trinetra_guest_mode') === 'true';
 
   useEffect(() => () => {
     if (previewUrl) {
       URL.revokeObjectURL(previewUrl);
     }
   }, [previewUrl]);
+
+  useEffect(() => {
+    if (workflowState !== 'RESULT_VISIBLE' || !result) return;
+
+    const feedbackTimer = window.setTimeout(() => {
+      setWorkflowState('FEEDBACK_OPEN');
+    }, RESULT_DISPLAY_HOLD_MS);
+
+    return () => {
+      window.clearTimeout(feedbackTimer);
+    };
+  }, [result, workflowState]);
+
+  useEffect(() => {
+    if (workflowState !== 'TRAINING_SUCCESS') return;
+
+    const successTimer = window.setTimeout(() => {
+      setTrainingJob(null);
+      setWorkflowState('IDLE');
+    }, TRAINING_SUCCESS_HOLD_MS);
+
+    return () => {
+      window.clearTimeout(successTimer);
+    };
+  }, [workflowState]);
+
+  useEffect(() => {
+    if (workflowState !== 'TRAINING' || !trainingJob?.job_id) return;
+
+    let isCancelled = false;
+
+    const pollJob = async () => {
+      try {
+        const response = await fetch(`/api/intelligence/veridex/feedback/jobs/${trainingJob.job_id}`);
+        const payload = await response.json();
+
+        if (!response.ok) {
+          throw new Error(payload.error || payload.detail || 'Failed to fetch training status');
+        }
+
+        if (isCancelled) return;
+        setTrainingJob(payload);
+
+        if (payload.status === 'completed') {
+          setTrainingError(null);
+          setWorkflowState('TRAINING_SUCCESS');
+        } else if (payload.status === 'failed') {
+          setTrainingError(payload.error || 'Veridex training failed');
+          setWorkflowState('TRAINING_ERROR');
+        }
+      } catch (pollError) {
+        if (isCancelled) return;
+        setTrainingError(pollError instanceof Error ? pollError.message : 'Failed to fetch training status');
+        setWorkflowState('TRAINING_ERROR');
+      }
+    };
+
+    void pollJob();
+    const intervalId = window.setInterval(() => {
+      void pollJob();
+    }, FEEDBACK_JOB_POLL_MS);
+
+    return () => {
+      isCancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [trainingJob?.job_id, workflowState]);
 
   const selectFile = (file: File) => {
     if (previewUrl) {
@@ -2726,6 +3239,9 @@ const IntelligenceScanning = () => {
     setPreviewUrl(URL.createObjectURL(file));
     setResult(null);
     setError(null);
+    setTrainingError(null);
+    setTrainingJob(null);
+    setWorkflowState('IDLE');
   };
 
   const handleDrop = (event: React.DragEvent) => {
@@ -2738,11 +3254,14 @@ const IntelligenceScanning = () => {
   };
 
   const runVeridex = async () => {
-    if (!selectedFile) return;
+    if (!selectedFile || isGuest) return;
 
     try {
       setIsAnalyzing(true);
+      setWorkflowState('ANALYZING');
       setError(null);
+      setTrainingError(null);
+      setTrainingJob(null);
       setResult(null);
 
       const formData = new FormData();
@@ -2755,21 +3274,21 @@ const IntelligenceScanning = () => {
       const payload = await response.json();
 
       if (!response.ok) {
-        throw new Error(payload.error || 'Veridex analysis failed');
+        throw new Error(payload.error || payload.detail || 'Veridex analysis failed');
       }
 
       setResult(payload);
+      setWorkflowState('RESULT_VISIBLE');
     } catch (analysisError) {
       setError(analysisError instanceof Error ? analysisError.message : 'Veridex analysis failed');
+      setWorkflowState('ANALYSIS_ERROR');
     } finally {
       setIsAnalyzing(false);
     }
   };
 
-  const labelTone = result?.label === 'AI GENERATED'
+  const labelTone = result?.prediction === 'AI'
     ? 'border-error bg-error/10 text-error'
-    : result?.label === 'SUSPICIOUS'
-    ? 'border-tertiary bg-tertiary/10 text-tertiary'
     : 'border-primary bg-primary/10 text-primary';
 
   const formatProbability = (value?: number) => {
@@ -2777,8 +3296,124 @@ const IntelligenceScanning = () => {
     return `${(value * 100).toFixed(1)}%`;
   };
 
+  const workflowStatus = useMemo(() => {
+    switch (workflowState) {
+      case 'ANALYZING':
+        return 'Running';
+      case 'RESULT_VISIBLE':
+        return 'Result Ready';
+      case 'FEEDBACK_OPEN':
+        return 'Awaiting Feedback';
+      case 'TRAINING':
+        return 'Training';
+      case 'TRAINING_SUCCESS':
+        return 'Training Complete';
+      case 'TRAINING_ERROR':
+        return 'Training Error';
+      case 'ANALYSIS_ERROR':
+        return 'Analysis Error';
+      default:
+        return 'Ready';
+    }
+  }, [workflowState]);
+
+  const feedbackCopy = useMemo(() => {
+    if (!result) return null;
+
+    if (result.prediction === 'AI') {
+      return {
+        question: 'Is the feedback correct?',
+        yesLabel: 'Yes, It is AI / Suspicious',
+        noLabel: 'No, It is Real',
+        yesValue: 'AI' as const,
+        noValue: 'REAL' as const,
+      };
+    }
+
+    return {
+      question: 'Is the feedback correct?',
+      yesLabel: 'Yes, It is Real',
+      noLabel: 'No, It is AI / Suspicious',
+      yesValue: 'REAL' as const,
+      noValue: 'AI' as const,
+    };
+  }, [result]);
+
+  const trainingStageLabel = useMemo(() => {
+    switch (trainingJob?.stage) {
+      case 'storing':
+        return 'Storing temporary feedback sample';
+      case 'training':
+        return 'Retraining xgb_fusion.pkl';
+      case 'cleaning':
+        return 'Cleaning temporary feedback data';
+      case 'completed':
+        return 'Training complete';
+      case 'failed':
+        return 'Training failed';
+      default:
+        return 'Queueing training job';
+    }
+  }, [trainingJob?.stage]);
+
+  const resetWorkflowOverlay = () => {
+    setTrainingError(null);
+    setTrainingJob(null);
+    setWorkflowState('IDLE');
+  };
+
+  const handleSkipFeedback = () => {
+    setTrainingError(null);
+    setTrainingJob(null);
+    setWorkflowState('IDLE');
+  };
+
+  const submitFeedback = async (userFeedback: 'AI' | 'REAL') => {
+    if (!selectedFile || !result) return;
+
+    try {
+      setTrainingError(null);
+      setTrainingJob(null);
+      setWorkflowState('TRAINING');
+
+      const formData = new FormData();
+      formData.append('image', selectedFile);
+      formData.append('prediction', result.prediction);
+      formData.append('user_feedback', userFeedback);
+      formData.append('confidence_score', String(result.confidence_score));
+      formData.append('ai_probability', String(result.ai_probability));
+      formData.append('real_probability', String(result.real_probability));
+      if (typeof result.component_scores?.cnn === 'number') {
+        formData.append('classifier_score', String(result.component_scores.cnn));
+      }
+
+      const response = await fetch('/api/intelligence/veridex/feedback', {
+        method: 'POST',
+        body: formData,
+      });
+      const payload = await response.json();
+
+      if (!response.ok) {
+        throw new Error(payload.error || payload.detail || 'Failed to submit Veridex feedback');
+      }
+
+      setTrainingJob(payload);
+    } catch (feedbackError) {
+      setTrainingError(feedbackError instanceof Error ? feedbackError.message : 'Failed to submit Veridex feedback');
+      setWorkflowState('TRAINING_ERROR');
+    }
+  };
+
+  const showWorkflowOverlay = ['FEEDBACK_OPEN', 'TRAINING', 'TRAINING_SUCCESS', 'TRAINING_ERROR'].includes(workflowState);
+  const hasActiveWorkflow = ['RESULT_VISIBLE', 'FEEDBACK_OPEN', 'TRAINING', 'TRAINING_SUCCESS'].includes(workflowState);
+  const runDisabled = isGuest || !selectedFile || isAnalyzing || hasActiveWorkflow || showWorkflowOverlay;
+
   return (
-    <div className="h-full grid grid-cols-1 xl:grid-cols-2 gap-6 animate-in fade-in duration-500 items-stretch">
+    <div className="relative h-full">
+      <div className={cn(
+        'h-full grid grid-cols-1 xl:grid-cols-2 gap-6 animate-in fade-in duration-500 items-stretch',
+        isGuest && 'pointer-events-none select-none blur-[3px] opacity-45',
+      )}>
       <div className="h-full">
         <div className="bg-surface-container border border-outline-variant p-6 h-full min-h-[720px] flex flex-col">
           <div className="border-b border-outline-variant pb-3">
@@ -2815,9 +3450,9 @@ const IntelligenceScanning = () => {
             </div>
           )}
 
-          <Button variant="primary" onClick={runVeridex} disabled={!selectedFile || isAnalyzing} className="w-full py-3 mt-5">
+          <Button variant="primary" onClick={runVeridex} disabled={runDisabled} className="w-full py-3 mt-5">
             {isAnalyzing ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Cpu className="w-4 h-4 mr-2" />}
-            {isAnalyzing ? 'Running Veridex...' : 'Run Veridex CNN'}
+            {isAnalyzing ? 'Running...' : 'Run'}
           </Button>
 
           {error && (
@@ -2829,15 +3464,15 @@ const IntelligenceScanning = () => {
           <div className="bg-surface-container-lowest border border-outline-variant p-4 font-mono text-[11px] space-y-3 mt-5">
             <div className="flex justify-between items-center border-b border-outline-variant pb-2">
               <span className="text-outline uppercase text-[9px] tracking-widest">Engine Status</span>
-              <span className={`text-[9px] uppercase ${isAnalyzing ? 'text-primary animate-pulse' : 'text-on-surface-variant'}`}>
-                {isAnalyzing ? 'Running' : 'Ready'}
+              <span className={`text-[9px] uppercase ${workflowState === 'ANALYZING' || workflowState === 'TRAINING' ? 'text-primary animate-pulse' : workflowState === 'ANALYSIS_ERROR' || workflowState === 'TRAINING_ERROR' ? 'text-error' : 'text-on-surface-variant'}`}>
+                {workflowStatus}
               </span>
             </div>
             <div className="space-y-1 text-on-surface-variant">
               <div>Model: Veridex CNN (ResNet50)</div>
-              <div>Mode: Real vs AI classification</div>
-              <div>Weights: `resnet50_veridex.pt`</div>
-              <div>Runtime: Veridex virtual environment</div>
+              <div>Mode: Strict ResNet50 to XGBoost classification</div>
+              <div>Weights: `resnet50_veridex.pt` to `xgb_fusion.pkl`</div>
+              <div>Runtime: Temporary feedback workflow</div>
             </div>
           </div>
         </div>
@@ -2856,8 +3491,8 @@ const IntelligenceScanning = () => {
           )}
         </div>
 
-        <div className="flex flex-col gap-3 flex-1 min-h-0">
-          <div className="bg-black relative forensic-grid border border-outline-variant overflow-hidden min-h-[260px] xl:min-h-[280px] max-h-[300px] rounded-[20px]">
+        <div className="flex flex-col gap-4 flex-1 min-h-0">
+          <div className="bg-black relative forensic-grid border border-outline/70 shadow-[inset_0_0_0_1px_rgba(138,146,150,0.16),0_0_0_1px_rgba(64,72,75,0.28)] overflow-hidden min-h-[260px] xl:min-h-[280px] max-h-[300px]">
             {previewUrl ? (
               <>
                 <img src={previewUrl} alt="Veridex input" className="w-full h-full object-contain" />
@@ -2881,13 +3516,13 @@ const IntelligenceScanning = () => {
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4 min-w-0">
-            <div className="bg-surface-container-lowest border border-outline-variant rounded-[20px] p-4 min-w-0 overflow-hidden min-h-[108px] flex flex-col justify-between">
+            <div className="bg-surface-container-lowest border border-outline/60 shadow-[inset_0_0_0_1px_rgba(138,146,150,0.12)] p-4 min-w-0 overflow-hidden min-h-[108px] flex flex-col justify-between">
               <p className="font-mono text-[10px] text-outline uppercase tracking-[0.14em]">AI Probability</p>
               <p className="mt-3 font-mono text-[clamp(1.55rem,2vw,2.1rem)] leading-none text-error font-bold tracking-tight whitespace-nowrap">
                 {formatProbability(result?.ai_probability)}
               </p>
             </div>
-            <div className="bg-surface-container-lowest border border-outline-variant rounded-[20px] p-4 min-w-0 overflow-hidden min-h-[108px] flex flex-col justify-between">
+            <div className="bg-surface-container-lowest border border-outline/60 shadow-[inset_0_0_0_1px_rgba(138,146,150,0.12)] p-4 min-w-0 overflow-hidden min-h-[108px] flex flex-col justify-between">
               <p className="font-mono text-[10px] text-outline uppercase tracking-[0.14em]">Real Probability</p>
               <p className="mt-3 font-mono text-[clamp(1.55rem,2vw,2.1rem)] leading-none text-primary font-bold tracking-tight whitespace-nowrap">
                 {formatProbability(result?.real_probability)}
@@ -2895,14 +3530,14 @@ const IntelligenceScanning = () => {
             </div>
           </div>
 
-          <div className="bg-surface-container-lowest border border-outline-variant rounded-[20px] p-4 space-y-3">
+          <div className="bg-surface-container-lowest border border-outline/60 shadow-[inset_0_0_0_1px_rgba(138,146,150,0.12)] p-4 space-y-3">
             <div className="flex justify-between font-mono text-[10px] uppercase tracking-[0.14em] text-outline">
               <span>Threshold</span>
               <span>{result ? `${(result.threshold * 100).toFixed(0)}%` : '70%'}</span>
             </div>
-            <div className="relative w-full h-2 bg-surface-container-highest border border-outline-variant overflow-hidden rounded-full">
+            <div className="relative w-full h-2 bg-surface-container-highest border border-outline-variant/80 shadow-[inset_0_1px_2px_rgba(0,0,0,0.45)] overflow-hidden">
               <div
-                className="h-full bg-primary/60 transition-all duration-500 rounded-full"
+                className="h-full bg-primary/60 transition-all duration-500"
                 style={{ width: `${((result?.threshold ?? 0.7) * 100).toFixed(1)}%` }}
               />
               <div
@@ -2911,7 +3546,7 @@ const IntelligenceScanning = () => {
               />
               {result ? (
                 <div
-                  className="absolute top-1/2 h-3 w-3 -translate-y-1/2 rounded-full border border-error bg-error shadow-[0_0_12px_rgba(255,179,171,0.35)] transition-all duration-500"
+                  className="absolute top-1/2 h-3 w-3 -translate-y-1/2 border border-error bg-error shadow-[0_0_12px_rgba(255,179,171,0.35)] transition-all duration-500"
                   style={{ left: `calc(${(result.ai_probability * 100).toFixed(1)}% - 6px)` }}
                 />
               ) : null}
@@ -2922,7 +3557,7 @@ const IntelligenceScanning = () => {
             </div>
           </div>
 
-          <div className="bg-surface-container-lowest border border-outline-variant rounded-[20px] p-4 font-mono text-[10px] space-y-3">
+          <div className="bg-surface-container-lowest border border-outline/60 shadow-[inset_0_0_0_1px_rgba(138,146,150,0.12)] p-4 font-mono text-[10px] space-y-3 flex-1">
             <div>
               <p className="text-outline uppercase tracking-[0.16em]">Engine</p>
               <p className="text-on-surface mt-2 text-[11px] uppercase tracking-[0.08em]">{result?.engine || 'Veridex'}</p>
@@ -2930,7 +3565,7 @@ const IntelligenceScanning = () => {
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div>
                 <p className="text-outline uppercase tracking-[0.14em]">Model</p>
-                <p className="text-on-surface mt-2 break-words">{result?.model || 'ResNet50 CNN'}</p>
+                <p className="text-on-surface mt-2 break-words">{result?.model || 'Strict Veridex Chain'}</p>
               </div>
               <div>
                 <p className="text-outline uppercase tracking-[0.14em]">Weights</p>
@@ -2948,6 +3583,118 @@ const IntelligenceScanning = () => {
           </div>
         </div>
       </div>
+      </div>
+
+      {isGuest && (
+        <div className="absolute inset-0 z-30 flex items-center justify-center p-6">
+          <div className="max-w-xl border border-primary/30 bg-surface-container/95 backdrop-blur-sm p-6 text-center space-y-3">
+            <Shield className="w-10 h-10 text-primary mx-auto" />
+            <p className="font-mono text-sm uppercase tracking-widest text-on-surface">Signed Up Users Only</p>
+            <p className="font-mono text-[10px] text-outline uppercase">This feature should be used by the Signed Up users.</p>
+          </div>
+        </div>
+      )}
+
+      <AnimatePresence>
+        {!isGuest && showWorkflowOverlay && (
+          <motion.div
+            className="absolute inset-0 z-20 flex items-center justify-center bg-black/72 backdrop-blur-sm p-4"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+          >
+            <motion.div
+              className="w-full max-w-xl border border-outline bg-surface-container p-6 font-mono shadow-[0_0_0_1px_rgba(138,146,150,0.14),0_24px_80px_rgba(0,0,0,0.5)]"
+              initial={{ opacity: 0, y: 18 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 12 }}
+            >
+              {workflowState === 'FEEDBACK_OPEN' && feedbackCopy && result && (
+                <div className="space-y-5">
+                  <div className="border-b border-outline-variant pb-4">
+                    <p className="text-[10px] uppercase tracking-[0.2em] text-outline">Feedback Collection</p>
+                    <h3 className="mt-2 text-lg uppercase tracking-[0.14em] text-on-surface">{feedbackCopy.question}</h3>
+                    <p className="mt-2 text-[11px] uppercase tracking-[0.12em] text-on-surface-variant">
+                      Result shown: Image Detected: {result.display_label}
+                    </p>
+                  </div>
+                  <div className="grid grid-cols-1 gap-3">
+                    <Button variant="primary" onClick={() => void submitFeedback(feedbackCopy.yesValue)} className="w-full justify-center py-3">
+                      {feedbackCopy.yesLabel}
+                    </Button>
+                    <Button variant="secondary" onClick={() => void submitFeedback(feedbackCopy.noValue)} className="w-full justify-center py-3">
+                      {feedbackCopy.noLabel}
+                    </Button>
+                    <Button variant="ghost" onClick={handleSkipFeedback} className="w-full justify-center py-3">
+                      <SkipForward className="mr-2 h-4 w-4" />
+                      Skip
+                    </Button>
+                  </div>
+                  <p className="text-[10px] uppercase tracking-[0.12em] text-outline">
+                    Skip closes the workflow without storing data or retraining the model.
+                  </p>
+                </div>
+              )}
+
+              {workflowState === 'TRAINING' && (
+                <div className="space-y-5">
+                  <div className="border-b border-outline-variant pb-4">
+                    <p className="text-[10px] uppercase tracking-[0.2em] text-outline">Training Pipeline</p>
+                    <h3 className="mt-2 text-lg uppercase tracking-[0.14em] text-on-surface">Training Loading Screen</h3>
+                    <p className="mt-2 text-[11px] uppercase tracking-[0.12em] text-on-surface-variant">{trainingStageLabel}</p>
+                  </div>
+                  <div className="flex items-center gap-3 border border-outline/60 bg-surface-container-lowest p-4">
+                    <Loader2 className="h-5 w-5 animate-spin text-primary" />
+                    <div className="space-y-1 text-[10px] uppercase tracking-[0.14em] text-on-surface-variant">
+                      <p>Status: {trainingJob?.status || 'queued'}</p>
+                      <p>Model: xgb_fusion.pkl only</p>
+                      <p>Cleanup: temporary image and feedback record deleted after training</p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {workflowState === 'TRAINING_SUCCESS' && (
+                <div className="space-y-5">
+                  <div className="border-b border-outline-variant pb-4">
+                    <p className="text-[10px] uppercase tracking-[0.2em] text-outline">Training Complete</p>
+                    <h3 className="mt-2 text-lg uppercase tracking-[0.14em] text-primary">Veridex Retraining Finished</h3>
+                    <p className="mt-2 text-[11px] uppercase tracking-[0.12em] text-on-surface-variant">
+                      Temporary feedback data was used, cleaned up, and the workflow is returning to idle.
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-3 border border-primary/30 bg-primary/10 p-4 text-primary">
+                    <CheckCircle2 className="h-5 w-5" />
+                    <div className="space-y-1 text-[10px] uppercase tracking-[0.14em]">
+                      <p>Status: completed</p>
+                      <p>Model updated: xgb_fusion.pkl</p>
+                      <p>Cleanup complete</p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {workflowState === 'TRAINING_ERROR' && (
+                <div className="space-y-5">
+                  <div className="border-b border-outline-variant pb-4">
+                    <p className="text-[10px] uppercase tracking-[0.2em] text-outline">Training Error</p>
+                    <h3 className="mt-2 text-lg uppercase tracking-[0.14em] text-error">Veridex retraining failed</h3>
+                    <p className="mt-2 text-[11px] uppercase tracking-[0.12em] text-on-surface-variant">
+                      Temporary feedback cleanup was attempted before returning the workflow to idle.
+                    </p>
+                  </div>
+                  <div className="border border-error/40 bg-error/10 p-4 text-xs text-error">
+                    {trainingError || 'An unknown training error occurred.'}
+                  </div>
+                  <Button variant="primary" onClick={resetWorkflowOverlay} className="w-full justify-center py-3">
+                    Close and Return to Idle
+                  </Button>
+                </div>
+              )}
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 };
@@ -3105,8 +3852,8 @@ const HistoryTable = () => {
         ) : isGuest ? (
           <div className="p-10 text-center space-y-3">
             <History className="w-10 h-10 text-outline mx-auto" />
-            <p className="font-mono text-sm uppercase tracking-widest text-on-surface">History Unavailable</p>
-            <p className="font-mono text-[10px] text-outline uppercase">Sign in or sign up to view real asset history.</p>
+            <p className="font-mono text-sm uppercase tracking-widest text-on-surface">No Data Available In Guest Mode</p>
+            <p className="font-mono text-[10px] text-outline uppercase">Please sign up to view real asset history.</p>
           </div>
         ) : error ? (
           <div className="p-10 text-center space-y-3">
@@ -3141,7 +3888,7 @@ const HistoryTable = () => {
                 <div className="md:col-span-3 min-w-0">
                   <div className="flex items-start justify-between gap-2">
                     <p className="font-mono text-[11px] text-on-surface uppercase truncate">{asset.filename}</p>
-                    {asset.is_local_only ? <ProtectedAssetBadge compact /> : null}
+                    {asset.is_local_only || asset.is_registry_only ? <ProtectedAssetBadge compact /> : null}
                   </div>
                   <p className="font-mono text-[10px] text-outline truncate">{asset.id}</p>
                 </div>
@@ -3211,7 +3958,52 @@ const buildStructuredPrompt = (file: File, captions: string[], matchSource?: str
   ].join('\n');
 };
 
-const PipelineWorkflow: React.FC = () => {
+const isValidHttpUrl = (value?: string) => {
+  if (!value?.trim()) return false;
+  try {
+    const parsed = new URL(value.trim());
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+};
+
+const isValidEmail = (value?: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test((value || '').trim());
+
+const buildScanReportForm = (data: PipelineData, matchResult?: MatchResult): ReportFormState => {
+  const userEmail = localStorage.getItem('trinetra_user_email') || '';
+  const profile = userEmail ? ensureUserProfile(userEmail) : null;
+  const detectedTargetUrl =
+    (typeof data.webSearchResults?.[0]?.url === 'string' && data.webSearchResults[0].url) ||
+    (data.matchedImageSource === 'web' && isValidHttpUrl(data.matchedImageUrl) ? data.matchedImageUrl : '') ||
+    '';
+  const reporterName = profile?.displayName || userEmail.split('@')[0] || 'Reporter';
+  const verdict = matchResult?.label || data.verdict || 'Pending';
+
+  return {
+    reporterName,
+    reporterEmail: userEmail,
+    reporterUserId: profile?.userId || localStorage.getItem('trinetra_clerk_id') || '',
+    accountJoinedSince: profile?.accountJoinedSince || '',
+    rightsHolder: reporterName,
+    assetId: data.dashboardAssetId || '',
+    assetFilename: data.image?.name || data.uploadedImageAnalysis?.filename || 'uploaded-image',
+    assetMimeType: data.image?.type || 'image/*',
+    assetSizeLabel: formatBytes(data.image?.size),
+    assetSizeBytes: data.image?.size || 0,
+    verdict: String(verdict),
+    finalScore: Number(matchResult?.score || data.mlConfidence || 0),
+    matchedReference: data.matchedImageLabel || matchResult?.matchedImageLabel || 'Unavailable',
+    matchedSource: data.matchedImageSource || matchResult?.source || 'Unavailable',
+    targetUrl: detectedTargetUrl,
+    contactEmail: '',
+    issueSummary: data.decisionExplanation || 'Potential unauthorized image reuse detected during scan review.',
+    notes: '',
+    declarationAccepted: false,
+  };
+};
+
+const PipelineWorkflow: React.FC<{ onNavigateToDashboard?: () => void }> = ({ onNavigateToDashboard }) => {
   const [pipelineState, setPipelineState] = useState<PipelineState>({
     currentStep: 'INPUT_IMAGE',
     status: 'idle',
@@ -3222,10 +4014,17 @@ const PipelineWorkflow: React.FC = () => {
   const [isMobile, setIsMobile] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showComparison, setShowComparison] = useState(false);
+  const [guestRestrictionFeature, setGuestRestrictionFeature] = useState<string | null>(null);
+  const [showReportModal, setShowReportModal] = useState(false);
+  const [showReportSubmittedModal, setShowReportSubmittedModal] = useState(false);
+  const [reportForm, setReportForm] = useState<ReportFormState | null>(null);
+  const [isSubmittingReport, setIsSubmittingReport] = useState(false);
+  const [reportMessage, setReportMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [showProtectModal, setShowProtectModal] = useState(false);
   const [protectOwnerName, setProtectOwnerName] = useState('protected_asset');
   const [isProtecting, setIsProtecting] = useState(false);
   const [protectMessage, setProtectMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const isGuest = localStorage.getItem('trinetra_guest_mode') === 'true';
 
   useEffect(() => {
     const checkMobile = () => setIsMobile(window.innerWidth < 768);
@@ -3258,18 +4057,35 @@ const PipelineWorkflow: React.FC = () => {
     const featurePhaseStartedAt = Date.now();
 
     try {
-      // Call actual API
       const formData = new FormData();
       formData.append('file', file);
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+      let response: Response;
+      try {
+        response = await fetch('/api/analyze-image', {
+          method: 'POST',
+          body: formData,
+          signal: controller.signal,
+        });
+      } finally {
+        window.clearTimeout(timeoutId);
+      }
 
-      const response = await fetch('/api/analyze-image', {
-        method: 'POST',
-        body: formData,
-      });
+      const result = await parseApiResponse<Record<string, any>>(response);
+      if (!response.ok) {
+        throw new Error(
+          (result && typeof result === 'object' && ('error' in result || 'detail' in result)
+            ? String(result.error || result.detail)
+            : undefined) || `Pipeline analysis failed (${response.status})`
+        );
+      }
+      if (!result) {
+        throw new Error('Pipeline returned an empty response.');
+      }
 
-      const result = await response.json();
-      await wait(Math.max(0, 3200 - (Date.now() - featurePhaseStartedAt)));
-      const comparisonImage = result.visual ? `${result.visual}?t=${Date.now()}` : undefined;
+      await wait(Math.max(0, FEATURE_EXTRACTION_MIN_MS - (Date.now() - featurePhaseStartedAt)));
+      const comparisonImage = withCacheBusting(result.visual);
       const matchedImageUrlRaw =
         result.matched_image_url ||
         result.matchedImageUrl ||
@@ -3282,6 +4098,17 @@ const PipelineWorkflow: React.FC = () => {
         result.match?.imageUrl ||
         result.local_match?.image_url ||
         result.local_match?.imageUrl;
+      const matchedMediaId =
+        result.matched_media_id ||
+        result.matchedMediaId ||
+        result.matched_id ||
+        result.local_match?.media_id ||
+        result.local_match?.mediaId ||
+        result.local_match?.id;
+      const matchedPhash =
+        result.matched_phash ||
+        result.matchedPhash ||
+        result.local_match?.phash;
       const matchedImageLabel =
         result.evidence?.matched_file ||
         result.matched_file ||
@@ -3290,15 +4117,26 @@ const PipelineWorkflow: React.FC = () => {
         result.title ||
         result.source ||
         result.source_url;
-      const matchedImageUrl = matchedImageUrlRaw
-        ? `${matchedImageUrlRaw}${String(matchedImageUrlRaw).includes('?') ? '&' : '?'}t=${Date.now()}`
-        : undefined;
+      let matchedImageUrl = withCacheBusting(matchedImageUrlRaw);
+      if (!matchedImageUrl && matchedMediaId && String(matchedMediaId) !== '0') {
+        const resolvedPreviewUrl = await resolveMatchedAssetPreview(String(matchedMediaId));
+        matchedImageUrl = withCacheBusting(resolvedPreviewUrl);
+      }
+      const cachedMatchedPreview = !matchedImageUrl
+        ? resolveMatchedPreviewFromProtectedCache(
+            matchedMediaId ? String(matchedMediaId) : undefined,
+            matchedPhash ? String(matchedPhash) : undefined,
+          )
+        : {};
+      if (!matchedImageUrl && cachedMatchedPreview.previewUrl) {
+        matchedImageUrl = cachedMatchedPreview.previewUrl;
+      }
       const captions = result.uploaded_image_analysis?.captions || result.blip_captions || [];
       const primaryCaption = captions[0] || '';
       const structuredPrompt = buildStructuredPrompt(file, captions, result.source);
       const vectorDbId = buildVectorDbId(file);
-      const clipSimilarity = result.clip_score || result.score;
-      const pHashSimilarity = result.phash_score || result.score * 0.8;
+      const clipSimilarity = result.clip_score ?? result.score;
+      const pHashSimilarity = result.phash_score ?? result.score * 0.8;
       const baseUpdates: Partial<PipelineData> = {
         structuredPrompt,
         vectorDbId,
@@ -3307,21 +4145,27 @@ const PipelineWorkflow: React.FC = () => {
         uploadedImageAnalysis: result.uploaded_image_analysis,
         comparisonImage,
         matchedImageUrl,
-        matchedImageLabel,
+        matchedImageLabel: matchedImageLabel || cachedMatchedPreview.label,
         matchedImageSource: result.source,
+        matchedMediaId: matchedMediaId ? String(matchedMediaId) : undefined,
+        matchedPhash: matchedPhash ? String(matchedPhash) : undefined,
         clipSimilarity,
         pHashSimilarity,
+        webSearchAttempted: result.web_search_attempted !== false,
+        decisionExplanation: result.explanation,
+        decisionAction: result.action,
+        fraudLikelihood: result.fraud,
       };
 
       updatePipelineData(baseUpdates);
       advanceToStep('PROMPT_GEN');
-      await wait(1800);
+      await wait(STAGE_TRANSITION_MEDIUM_MS);
       advanceToStep('VECTOR_DB_STORAGE');
-      await wait(1600);
+      await wait(STAGE_TRANSITION_FAST_MS);
       advanceToStep('SCAN_TRIGGER');
-      await wait(1400);
+      await wait(STAGE_TRANSITION_FAST_MS);
       advanceToStep('DATA_RETRIEVAL');
-      await wait(1700);
+      await wait(STAGE_TRANSITION_MEDIUM_MS);
       advanceToStep('LOCAL_DB_SEARCH');
 
       if (result.match_found) {
@@ -3335,9 +4179,35 @@ const PipelineWorkflow: React.FC = () => {
           pHashSimilarity: result.phash_score || result.score * 0.9,
         });
         setPipelineState(prev => ({ ...prev, skippedSteps: ['WEB_SEARCH', 'SIMILARITY_MATCHING'] }));
-        await wait(2400);
+        await wait(STAGE_TRANSITION_SLOW_MS);
         advanceToStep('ML_DECISION');
-        await wait(1900);
+        await wait(STAGE_TRANSITION_MEDIUM_MS);
+        advanceToStep('FINAL_OUTPUT');
+      } else if (result.label === 'NO EXTERNAL MATCH') {
+        updatePipelineData({
+          ...baseUpdates,
+          localSearchMatch: false,
+          localSearchResults: [],
+          webSearchResults: [],
+          clipSimilarity,
+          pHashSimilarity,
+          verdict: 'NO EXTERNAL MATCH',
+          mlConfidence: result.score ?? 0,
+          matchedImageSource: result.source || baseUpdates.matchedImageSource,
+        });
+        const webSearchAttempted = result.web_search_attempted !== false;
+        setPipelineState(prev => ({ ...prev, skippedSteps: webSearchAttempted ? [] : ['WEB_SEARCH', 'SIMILARITY_MATCHING'] }));
+        if (webSearchAttempted) {
+          await wait(STAGE_TRANSITION_FAST_MS);
+          advanceToStep('WEB_SEARCH');
+          await wait(Math.max(STAGE_TRANSITION_SLOW_MS, WEB_SEARCH_DURATION_MS - 300));
+          advanceToStep('SIMILARITY_MATCHING');
+          await wait(STAGE_TRANSITION_MEDIUM_MS);
+        } else {
+          await wait(STAGE_TRANSITION_SLOW_MS);
+        }
+        advanceToStep('ML_DECISION');
+        await wait(STAGE_TRANSITION_MEDIUM_MS);
         advanceToStep('FINAL_OUTPUT');
       } else {
         updatePipelineData({
@@ -3345,19 +4215,19 @@ const PipelineWorkflow: React.FC = () => {
           localSearchMatch: false,
           localSearchResults: [],
           webSearchResults: result.source === 'web' ? [{ url: result.source_url, similarity: result.score / 100 }] : [],
-          clipSimilarity: result.score,
-          pHashSimilarity: result.score * 0.8,
+          clipSimilarity,
+          pHashSimilarity,
           verdict: result.label,
           mlConfidence: result.score,
         });
         setPipelineState(prev => ({ ...prev, skippedSteps: [] }));
-        await wait(2200);
+        await wait(STAGE_TRANSITION_FAST_MS);
         advanceToStep('WEB_SEARCH');
         await wait(WEB_SEARCH_DURATION_MS);
         advanceToStep('SIMILARITY_MATCHING');
-        await wait(2200);
+        await wait(STAGE_TRANSITION_MEDIUM_MS);
         advanceToStep('ML_DECISION');
-        await wait(1900);
+        await wait(STAGE_TRANSITION_MEDIUM_MS);
         advanceToStep('FINAL_OUTPUT');
       }
 
@@ -3365,7 +4235,15 @@ const PipelineWorkflow: React.FC = () => {
 
     } catch (error) {
       console.error('Pipeline error:', error);
-      updatePipelineData({ verdict: 'Error' });
+      const message = error instanceof Error && error.name === 'AbortError'
+        ? 'Pipeline request timed out while extracting features.'
+        : error instanceof Error
+        ? error.message
+        : 'Pipeline analysis failed';
+      updatePipelineData({
+        verdict: 'Error',
+        decisionExplanation: message,
+      });
       setPipelineState((prev: PipelineState) => ({ ...prev, status: 'error' }));
     }
   }, [pipelineState.data.image, updatePipelineData, advanceToStep]);
@@ -3376,6 +4254,11 @@ const PipelineWorkflow: React.FC = () => {
 
   const handleReset = () => {
     setShowComparison(false);
+    setGuestRestrictionFeature(null);
+    setShowReportModal(false);
+    setShowReportSubmittedModal(false);
+    setReportForm(null);
+    setReportMessage(null);
     setShowProtectModal(false);
     setProtectMessage(null);
     setPipelineState({
@@ -3388,42 +4271,222 @@ const PipelineWorkflow: React.FC = () => {
   };
 
   const buildMatchResult = (data: PipelineData): MatchResult | undefined => (
-    data.verdict && data.verdict !== 'Authentic' && data.verdict !== 'Error' ? {
-      label: data.verdict === 'Manipulated' ? 'EXACT MATCH' : data.verdict,
-      score: data.mlConfidence || 0,
-      clipScore: data.clipSimilarity ? data.clipSimilarity / 100 : 0,
-      phashScore: data.pHashSimilarity ? data.pHashSimilarity / 100 : 0,
-      risk: data.mlConfidence || 0,
-      fraud: data.mlConfidence && data.mlConfidence > 80 ? 'HIGH' : 'MEDIUM',
-      action: data.mlConfidence && data.mlConfidence > 90 ? 'BLOCK' : 'REVIEW',
-      explanation: data.localSearchMatch ? 'Local DB similarity >=80%' : 'Web search match detected',
+    data.verdict && data.verdict !== 'Error' ? {
+      label: data.verdict === 'Manipulated' ? 'EXACT MATCH' : data.verdict === 'Authentic' ? 'AUTHENTIC' : data.verdict,
+      score: typeof data.mlConfidence === 'number' ? data.mlConfidence : 0,
+      clipScore: typeof data.clipSimilarity === 'number' ? data.clipSimilarity / 100 : 0,
+      phashScore: typeof data.pHashSimilarity === 'number' ? data.pHashSimilarity / 100 : 0,
+      risk: typeof data.mlConfidence === 'number' ? data.mlConfidence : 0,
+      fraud: data.fraudLikelihood || (data.verdict === 'NO EXTERNAL MATCH' || data.verdict === 'Authentic' ? 'LOW' : (data.mlConfidence && data.mlConfidence > 80 ? 'HIGH' : 'MEDIUM')),
+      action: data.decisionAction || (data.verdict === 'NO EXTERNAL MATCH' || data.verdict === 'Authentic' ? 'PASS' : (data.mlConfidence && data.mlConfidence > 90 ? 'BLOCK' : 'REVIEW')),
+      explanation: data.decisionExplanation || (data.localSearchMatch ? 'Local DB similarity >=80%' : data.webSearchAttempted ? 'Web search completed without a reliable external match.' : 'Similarity analysis completed'),
       source: data.matchedImageSource,
+      matchedMediaId: data.matchedMediaId,
       matchedImageUrl: data.matchedImageUrl,
       matchedImageLabel: data.matchedImageLabel,
     } : undefined
   );
 
+  const updateReportFormField = useCallback(<K extends keyof ReportFormState,>(field: K, value: ReportFormState[K]) => {
+    setReportForm(prev => (prev ? { ...prev, [field]: value } : prev));
+    setReportMessage(null);
+  }, []);
+
+  const openReportModal = useCallback(() => {
+    if (isGuest) {
+      setGuestRestrictionFeature('Report');
+      return;
+    }
+    setProtectMessage(null);
+    setReportMessage(null);
+    setShowReportSubmittedModal(false);
+    setReportForm(buildScanReportForm(pipelineState.data, buildMatchResult(pipelineState.data)));
+    setShowReportModal(true);
+  }, [isGuest, pipelineState.data]);
+
+  const handleSubmitReport = useCallback(async () => {
+    if (localStorage.getItem('trinetra_guest_mode') === 'true') {
+      setReportMessage({ type: 'error', text: 'Sign in to submit a report and trigger takedown.' });
+      return false;
+    }
+
+    if (!reportForm) {
+      setReportMessage({ type: 'error', text: 'Report form is not ready yet.' });
+      return false;
+    }
+
+    if (!reportForm.reporterEmail.trim()) {
+      setReportMessage({ type: 'error', text: 'Reporter email is required.' });
+      return false;
+    }
+
+    if (!isValidEmail(reportForm.reporterEmail)) {
+      setReportMessage({ type: 'error', text: 'Reporter email must be a valid email address.' });
+      return false;
+    }
+
+    if (!reportForm.contactEmail.trim()) {
+      setReportMessage({ type: 'error', text: 'Official contact email is required.' });
+      return false;
+    }
+
+    if (!isValidEmail(reportForm.contactEmail)) {
+      setReportMessage({ type: 'error', text: 'Official contact email must be a valid email address.' });
+      return false;
+    }
+
+    if (!reportForm.targetUrl.trim()) {
+      setReportMessage({ type: 'error', text: 'Target URL is required.' });
+      return false;
+    }
+
+    if (!isValidHttpUrl(reportForm.targetUrl)) {
+      setReportMessage({ type: 'error', text: 'Target URL must be a valid http or https link.' });
+      return false;
+    }
+
+    if (!reportForm.issueSummary.trim()) {
+      setReportMessage({ type: 'error', text: 'Issue summary is required.' });
+      return false;
+    }
+
+    if (!reportForm.declarationAccepted) {
+      setReportMessage({ type: 'error', text: 'Please confirm the declaration before submitting.' });
+      return false;
+    }
+
+    try {
+      setIsSubmittingReport(true);
+      setReportMessage(null);
+      const result = await submitScanReport({
+        reporter_name: reportForm.reporterName.trim(),
+        reporter_email: reportForm.reporterEmail.trim(),
+        reporter_user_id: reportForm.reporterUserId.trim() || undefined,
+        account_joined_since: reportForm.accountJoinedSince.trim() || undefined,
+        rights_holder: reportForm.reporterName.trim() || reportForm.rightsHolder.trim(),
+        asset_id: reportForm.assetId.trim() || undefined,
+        asset_filename: reportForm.assetFilename,
+        asset_mime_type: reportForm.assetMimeType || undefined,
+        asset_size_bytes: reportForm.assetSizeBytes || undefined,
+        verdict: reportForm.verdict,
+        final_score: reportForm.finalScore,
+        matched_reference: reportForm.matchedReference || undefined,
+        matched_source: reportForm.matchedSource || undefined,
+        target_url: reportForm.targetUrl.trim(),
+        contact_email: reportForm.contactEmail.trim(),
+        issue_summary: reportForm.issueSummary.trim(),
+        notes: reportForm.notes.trim() || undefined,
+        declaration_accepted: reportForm.declarationAccepted,
+      });
+      setReportMessage(null);
+      return true;
+    } catch (error) {
+      setReportMessage({
+        type: 'error',
+        text: error instanceof Error ? error.message : 'Failed to submit report',
+      });
+      return false;
+    } finally {
+      setIsSubmittingReport(false);
+    }
+  }, [reportForm]);
+
+  const handleReportSubmitSuccess = useCallback(() => {
+    setShowReportModal(false);
+    setShowReportSubmittedModal(true);
+  }, []);
+
+  const handleCloseReportSubmitted = useCallback(() => {
+    setShowReportSubmittedModal(false);
+    setReportForm(null);
+    setReportMessage(null);
+    onNavigateToDashboard?.();
+  }, [onNavigateToDashboard]);
+
+  const canSubmitReport = Boolean(
+    reportForm?.reporterEmail.trim() &&
+    isValidEmail(reportForm?.reporterEmail) &&
+    reportForm?.contactEmail.trim() &&
+    isValidEmail(reportForm?.contactEmail) &&
+    reportForm?.targetUrl.trim() &&
+    isValidHttpUrl(reportForm?.targetUrl) &&
+    reportForm?.issueSummary.trim() &&
+    reportForm?.declarationAccepted &&
+    !isSubmittingReport,
+  );
+
   const handleExportReport = (data: PipelineData, matchResult?: MatchResult) => {
+    const generatedAt = new Date();
+    const captions = data.blipCaptions || data.uploadedImageAnalysis?.captions || [];
+    const embeddingPreview = data.uploadedImageAnalysis?.embedding?.preview || [];
+    const formatPercent = (value?: number) => `${(value ?? 0).toFixed(2)}%`;
+    const normalizedVerdict = data.verdict || 'Pending';
+    const finalLabel = matchResult?.label || normalizedVerdict;
+    const matchReference = data.matchedImageLabel || matchResult?.matchedImageLabel || 'N/A';
+    const matchSource = data.localSearchMatch
+      ? 'Local protected asset database'
+      : data.matchedImageSource || matchResult?.source || 'External source';
+    const summaryLine =
+      normalizedVerdict === 'Match Found'
+        ? 'A protected asset match was detected during analysis.'
+        : normalizedVerdict === 'NO EXTERNAL MATCH'
+        ? 'No external match was detected for the submitted image.'
+        : normalizedVerdict === 'Manipulated'
+        ? 'A high-confidence similarity event was detected and flagged for review.'
+        : normalizedVerdict === 'Suspicious'
+        ? 'The submitted image triggered a suspicious similarity signal.'
+        : 'Analysis completed with the available detection data.';
+    const separator = '='.repeat(78);
+    const subSeparator = '-'.repeat(78);
     const lines = [
-      'TRINETRA IMAGE ANALYSIS REPORT',
-      `Generated: ${new Date().toISOString()}`,
-      `File: ${data.image?.name || 'uploaded-image'}`,
-      `Verdict: ${data.verdict || 'Pending'}`,
-      `Confidence: ${data.mlConfidence?.toFixed(2) || '0.00'}%`,
-      `CLIP Similarity: ${data.clipSimilarity?.toFixed(2) || '0.00'}%`,
-      `pHash Similarity: ${data.pHashSimilarity?.toFixed(2) || '0.00'}%`,
-      `BLIP Captions: ${(data.blipCaptions || data.uploadedImageAnalysis?.captions || []).join(' | ') || 'N/A'}`,
-      `Embedding Model: ${data.uploadedImageAnalysis?.embedding?.model || 'N/A'}`,
-      `Embedding Type: ${data.uploadedImageAnalysis?.embedding?.type || 'N/A'}`,
-      `Embedding Dimensions: ${data.uploadedImageAnalysis?.embedding?.dimensions || 0}`,
-      `Embedding Preview: ${JSON.stringify(data.uploadedImageAnalysis?.embedding?.preview || [])}`,
-      `Comparison Image: ${data.comparisonImage || 'N/A'}`,
+      separator,
+      'TRINETRA DIGITAL ASSET ANALYSIS REPORT',
+      separator,
+      `Generated On        : ${generatedAt.toLocaleString()}`,
+      `Report Timestamp    : ${generatedAt.toISOString()}`,
+      `Case Status         : ${normalizedVerdict}`,
       '',
-      'Decision',
-      `Label: ${matchResult?.label || 'N/A'}`,
-      `Risk: ${matchResult?.fraud || 'N/A'}`,
-      `Action: ${matchResult?.action || 'N/A'}`,
-      `Explanation: ${matchResult?.explanation || 'N/A'}`,
+      subSeparator,
+      'EXECUTIVE SUMMARY',
+      subSeparator,
+      summaryLine,
+      '',
+      subSeparator,
+      'SUBMITTED ASSET',
+      subSeparator,
+      `File Name           : ${data.image?.name || 'uploaded-image'}`,
+      `Detection Verdict   : ${finalLabel}`,
+      `Confidence Score    : ${formatPercent(data.mlConfidence)}`,
+      `Source Match        : ${matchSource}`,
+      `Matched Reference   : ${matchReference}`,
+      '',
+      subSeparator,
+      'ANALYSIS METRICS',
+      subSeparator,
+      `CLIP Similarity     : ${formatPercent(data.clipSimilarity)}`,
+      `pHash Similarity    : ${formatPercent(data.pHashSimilarity)}`,
+      `Risk Level          : ${matchResult?.fraud || 'N/A'}`,
+      `Recommended Action  : ${matchResult?.action || 'N/A'}`,
+      `Decision Rationale  : ${matchResult?.explanation || 'N/A'}`,
+      '',
+      subSeparator,
+      'VISUAL / SEMANTIC OBSERVATIONS',
+      subSeparator,
+      `Generated Captions  : ${captions.length ? captions.join(' | ') : 'N/A'}`,
+      '',
+      subSeparator,
+      'TECHNICAL DETAILS',
+      subSeparator,
+      `Embedding Model     : ${data.uploadedImageAnalysis?.embedding?.model || 'N/A'}`,
+      `Embedding Type      : ${data.uploadedImageAnalysis?.embedding?.type || 'N/A'}`,
+      `Embedding Dimension : ${data.uploadedImageAnalysis?.embedding?.dimensions || 0}`,
+      `Vector Preview      : ${embeddingPreview.length ? JSON.stringify(embeddingPreview) : 'N/A'}`,
+      `Comparison Artifact : ${data.comparisonImage || 'N/A'}`,
+      '',
+      subSeparator,
+      'END OF REPORT',
+      subSeparator,
+      'Generated by Trinetra for digital asset comparison and authenticity review.',
     ];
     const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -3455,6 +4518,7 @@ const PipelineWorkflow: React.FC = () => {
       const fingerprint = await createAssetFingerprint(file);
       const formData = new FormData();
       formData.append('artist_name', artistName);
+      formData.append('user_email', localStorage.getItem('trinetra_user_email') || '');
       formData.append('file', file);
 
       const response = await fetch('/register', {
@@ -3470,6 +4534,9 @@ const PipelineWorkflow: React.FC = () => {
       if (localStorage.getItem('trinetra_guest_mode') !== 'true') {
         try {
           const registryAssetId = await linkAssetToDashboard(file);
+          if (registryAssetId) {
+            updatePipelineData({ dashboardAssetId: String(registryAssetId) });
+          }
           await cacheProtectedAssetForDashboard(
             localStorage.getItem('trinetra_user_email') || 'unknown',
             file,
@@ -3519,6 +4586,33 @@ const PipelineWorkflow: React.FC = () => {
     const { currentStep, data } = pipelineState;
     const isProcessing = pipelineState.status === 'running';
 
+    if (pipelineState.status === 'error') {
+      return (
+        <PipelineErrorView
+          message={data.decisionExplanation}
+          onRetry={() => {
+            setProtectMessage(null);
+            setPipelineState(prev => ({
+              ...prev,
+              currentStep: 'INPUT_IMAGE',
+              status: 'idle',
+              history: [],
+              skippedSteps: [],
+              data: {
+                ...prev.data,
+                verdict: undefined,
+                decisionExplanation: undefined,
+              },
+            }));
+            window.setTimeout(() => {
+              void simulatePipelineProgress();
+            }, 0);
+          }}
+          onReset={handleReset}
+        />
+      );
+    }
+
     switch (currentStep) {
       case 'INPUT_IMAGE':
         return <InputImageView data={data} onFileSelect={handleFileSelect} onNext={() => simulatePipelineProgress()} isProcessing={isProcessing} />;
@@ -3537,7 +4631,7 @@ const PipelineWorkflow: React.FC = () => {
       case 'WEB_SEARCH':
         return <WebSearchView data={data} isProcessing={isProcessing} />;
       case 'SIMILARITY_MATCHING':
-        return <SimilarityMatchingView data={data} />;
+        return <SimilarityMatchingView data={data} isProcessing={isProcessing} />;
       case 'ML_DECISION':
         return <MLDecisionView data={data} isProcessing={isProcessing} />;
       case 'FINAL_OUTPUT': {
@@ -3552,10 +4646,20 @@ const PipelineWorkflow: React.FC = () => {
             blipCaption={data.blipCaption}
             uploadedImageAnalysis={data.uploadedImageAnalysis}
             onNext={handleReset}
-            onOverride={() => updatePipelineData({ verdict: 'Authentic' })}
+            onReport={openReportModal}
             onViewComparison={() => setShowComparison(true)}
-            onExportReport={() => handleExportReport(data, matchResult)}
+            onExportReport={() => {
+              if (isGuest) {
+                setGuestRestrictionFeature('Export Report');
+                return;
+              }
+              handleExportReport(data, matchResult);
+            }}
             onProtect={() => {
+              if (isGuest) {
+                setGuestRestrictionFeature('Protect Asset');
+                return;
+              }
               setProtectMessage(null);
               setShowProtectModal(true);
             }}
@@ -3643,6 +4747,233 @@ const PipelineWorkflow: React.FC = () => {
           inputImageUrl={pipelineState.data.imagePreview}
           onClose={() => setShowComparison(false)}
         />
+      )}
+      {guestRestrictionFeature && (
+        <GuestRestrictionModal
+          feature={guestRestrictionFeature}
+          onClose={() => setGuestRestrictionFeature(null)}
+        />
+      )}
+      {showReportModal && reportForm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={() => !isSubmittingReport && setShowReportModal(false)} />
+          <motion.div
+            initial={{ opacity: 0, y: 16, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            className="relative w-full max-w-4xl bg-surface-container border border-error/30 shadow-2xl"
+          >
+            <div className="p-5 border-b border-outline-variant flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-error/10 border border-error/30 flex items-center justify-center text-error">
+                  <AlertTriangle className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-mono text-sm font-bold uppercase tracking-widest">Report Match</h3>
+                  <p className="font-mono text-[10px] text-outline uppercase">Similarity threshold met for takedown intake</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowReportModal(false)}
+                disabled={isSubmittingReport}
+                className="p-2 text-outline hover:text-on-surface hover:bg-surface-container-high transition-colors disabled:opacity-40"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="max-h-[80vh] overflow-y-auto custom-scrollbar p-5 space-y-5">
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 font-mono text-[10px]">
+                <div className="bg-surface-container-lowest border border-outline-variant p-4 space-y-3">
+                  <p className="text-error uppercase tracking-widest">Image Information</p>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="border border-outline-variant p-3">
+                      <p className="text-outline uppercase">Filename</p>
+                      <p className="text-on-surface break-all mt-1">{reportForm.assetFilename}</p>
+                    </div>
+                    <div className="border border-outline-variant p-3">
+                      <p className="text-outline uppercase">Final Score</p>
+                      <p className="text-error mt-1">{reportForm.finalScore.toFixed(1)}%</p>
+                    </div>
+                    <div className="border border-outline-variant p-3">
+                      <p className="text-outline uppercase">Type</p>
+                      <p className="text-on-surface mt-1">{reportForm.assetMimeType}</p>
+                    </div>
+                    <div className="border border-outline-variant p-3">
+                      <p className="text-outline uppercase">File Size</p>
+                      <p className="text-on-surface mt-1">{reportForm.assetSizeLabel}</p>
+                    </div>
+                    <div className="border border-outline-variant p-3">
+                      <p className="text-outline uppercase">Verdict</p>
+                      <p className="text-on-surface mt-1">{reportForm.verdict}</p>
+                    </div>
+                    <div className="border border-outline-variant p-3">
+                      <p className="text-outline uppercase">Matched Source</p>
+                      <p className="text-on-surface mt-1">{reportForm.matchedSource}</p>
+                    </div>
+                  </div>
+                  <div className="border border-outline-variant p-3">
+                    <p className="text-outline uppercase">Matched Reference</p>
+                    <p className="text-on-surface break-all mt-1">{reportForm.matchedReference}</p>
+                  </div>
+                  <div className="border border-outline-variant p-3">
+                    <p className="text-outline uppercase">Dashboard Asset ID</p>
+                    <p className="text-on-surface break-all mt-1">{reportForm.assetId || 'Not linked'}</p>
+                  </div>
+                </div>
+
+                <div className="bg-surface-container-lowest border border-outline-variant p-4 space-y-3">
+                  <p className="text-primary uppercase tracking-widest">User Information</p>
+                  <div className="block space-y-2">
+                    <span className="text-outline uppercase">Reporter Name</span>
+                    <div className="w-full bg-surface border border-outline-variant px-4 py-3 font-mono text-sm text-on-surface">
+                      {reportForm.reporterName || 'Unavailable'}
+                    </div>
+                  </div>
+                  <div className="block space-y-2">
+                    <span className="text-outline uppercase">Reporter Email</span>
+                    <div className="w-full bg-surface border border-outline-variant px-4 py-3 font-mono text-sm text-on-surface">
+                      {reportForm.reporterEmail || 'Unavailable'}
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div className="block space-y-2">
+                      <span className="text-outline uppercase">User ID</span>
+                      <div className="w-full bg-surface border border-outline-variant px-4 py-3 font-mono text-sm text-on-surface break-all">
+                        {reportForm.reporterUserId || 'Unavailable'}
+                      </div>
+                    </div>
+                    <div className="block space-y-2">
+                      <span className="text-outline uppercase">Joined Since</span>
+                      <div className="w-full bg-surface border border-outline-variant px-4 py-3 font-mono text-sm text-on-surface">
+                        {reportForm.accountJoinedSince || 'Unavailable'}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+                <label className="block space-y-2">
+                  <span className="font-mono text-[10px] text-outline uppercase">Reported URL</span>
+                  <input
+                    type="url"
+                    value={reportForm.targetUrl}
+                    onChange={(event) => updateReportFormField('targetUrl', event.target.value)}
+                    disabled={isSubmittingReport}
+                    className={cn(
+                      'w-full bg-surface-container-lowest border px-4 py-3 font-mono text-sm text-on-surface outline-none focus:border-error transition-colors disabled:opacity-60',
+                      reportForm.targetUrl.trim() && !isValidHttpUrl(reportForm.targetUrl)
+                        ? 'border-error/70'
+                        : 'border-outline-variant',
+                    )}
+                    placeholder="https://example.com/infringing-image"
+                  />
+                </label>
+                <label className="block space-y-2">
+                  <span className="font-mono text-[10px] text-outline uppercase">Official Contact Email</span>
+                  <input
+                    type="email"
+                    value={reportForm.contactEmail}
+                    onChange={(event) => updateReportFormField('contactEmail', event.target.value)}
+                    disabled={isSubmittingReport}
+                    className={cn(
+                      'w-full bg-surface-container-lowest border px-4 py-3 font-mono text-sm text-on-surface outline-none focus:border-error transition-colors disabled:opacity-60',
+                      reportForm.contactEmail.trim() && !isValidEmail(reportForm.contactEmail)
+                        ? 'border-error/70'
+                        : 'border-outline-variant',
+                    )}
+                    placeholder="legal@example.com"
+                  />
+                </label>
+              </div>
+
+              <label className="block space-y-2">
+                <span className="font-mono text-[10px] text-outline uppercase">Issue Summary</span>
+                <textarea
+                  value={reportForm.issueSummary}
+                  readOnly
+                  className="min-h-[110px] w-full resize-none bg-surface-container-lowest border border-outline-variant px-4 py-3 font-mono text-sm text-on-surface outline-none"
+                />
+              </label>
+
+              <label className="block space-y-2">
+                <span className="font-mono text-[10px] text-outline uppercase">Additional Notes</span>
+                <textarea
+                  value={reportForm.notes}
+                  onChange={(event) => updateReportFormField('notes', event.target.value)}
+                  disabled={isSubmittingReport}
+                  className="min-h-[110px] w-full resize-y bg-surface-container-lowest border border-outline-variant px-4 py-3 font-mono text-sm text-on-surface outline-none focus:border-error transition-colors disabled:opacity-60"
+                  placeholder="Any licensing context, ownership notes, or enforcement instructions..."
+                />
+              </label>
+
+              <label className="flex items-start gap-3 border border-outline-variant bg-surface-container-lowest p-4">
+                <input
+                  type="checkbox"
+                  checked={reportForm.declarationAccepted}
+                  onChange={(event) => updateReportFormField('declarationAccepted', event.target.checked)}
+                  disabled={isSubmittingReport}
+                  className="mt-1 h-4 w-4 accent-[var(--color-error)]"
+                />
+                <span className="font-mono text-[11px] text-on-surface">
+                  I confirm that this report is being submitted in good faith and that the provided ownership and contact details are accurate to the best of my knowledge.
+                </span>
+              </label>
+
+              {reportMessage && (
+                <div className={`border p-3 font-mono text-xs ${
+                  reportMessage.type === 'success'
+                    ? 'border-primary/40 bg-primary/10 text-primary'
+                    : 'border-error/40 bg-error/10 text-error'
+                }`}>
+                  {reportMessage.text}
+                </div>
+              )}
+            </div>
+
+            <div className="p-5 border-t border-outline-variant flex flex-wrap justify-end gap-3">
+              <Button variant="ghost" onClick={() => setShowReportModal(false)} disabled={isSubmittingReport}>
+                Cancel
+              </Button>
+              <SlideSubmitButton
+                disabled={!canSubmitReport}
+                onSubmit={handleSubmitReport}
+                onSuccess={handleReportSubmitSuccess}
+                idleLabel="Slide to Takedown"
+              />
+            </div>
+          </motion.div>
+        </div>
+      )}
+      {showReportSubmittedModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" />
+          <motion.div
+            initial={{ opacity: 0, y: 16, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            className="relative w-full max-w-md bg-surface-container border border-primary/30 shadow-2xl"
+          >
+            <div className="p-6 space-y-5">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-primary/10 border border-primary/30 flex items-center justify-center text-primary">
+                  <CheckCircle2 className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-mono text-sm font-bold uppercase tracking-widest">Report Submitted</h3>
+                  <p className="font-mono text-[10px] text-outline uppercase">Your takedown report has been sent successfully</p>
+                </div>
+              </div>
+              <div className="border border-primary/30 bg-primary/10 p-4 font-mono text-xs text-primary">
+                Your report is submitted.
+              </div>
+            </div>
+            <div className="p-5 border-t border-outline-variant flex justify-end">
+              <Button variant="primary" onClick={handleCloseReportSubmitted}>
+                Close
+              </Button>
+            </div>
+          </motion.div>
+        </div>
       )}
       {showProtectModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
@@ -3753,9 +5084,9 @@ const MobileSidebarContent: React.FC<{ onClose: () => void }> = ({ onClose }) =>
         </div>
       </div>
       <nav className="flex-1 py-4">
-        {!isGuest && <NavItem id="DASHBOARD" label="Dashboard" icon={Search} />}
+        <NavItem id="DASHBOARD" label="Dashboard" icon={Search} />
         <NavItem id="SCAN" label="Pipeline" icon={UploadCloud} />
-        {!isGuest && <NavItem id="HISTORY" label="History" icon={History} />}
+        <NavItem id="HISTORY" label="History" icon={History} />
         <NavItem id="INTELLIGENCE" label="Intelligence" icon={Cpu} />
       </nav>
       <div className="p-4 border-t border-outline-variant">
@@ -3769,8 +5100,8 @@ const MobileSidebarContent: React.FC<{ onClose: () => void }> = ({ onClose }) =>
   );
 };
 
-const ScanInterface = () => {
-  return <PipelineWorkflow />;
+const ScanInterface = ({ onNavigateToDashboard }: { onNavigateToDashboard?: () => void }) => {
+  return <PipelineWorkflow onNavigateToDashboard={onNavigateToDashboard} />;
 };
 
 const SettingsInterface = () => {
@@ -4005,6 +5336,11 @@ const ProtectInterface = () => {
   };
 
   const handleRegister = async () => {
+    if (isGuest) {
+      setMessage({ type: 'error', text: 'This feature should be used by the Signed Up users.' });
+      return;
+    }
+
     if (!file || !preview) {
       setMessage({ type: 'error', text: 'Upload an image before registering an asset.' });
       return;
@@ -4026,6 +5362,7 @@ const ProtectInterface = () => {
 
       const formData = new FormData();
       formData.append('artist_name', owner);
+      formData.append('user_email', localStorage.getItem('trinetra_user_email') || '');
       formData.append('file', file);
 
       const response = await fetch('/register', {
@@ -4097,7 +5434,8 @@ const ProtectInterface = () => {
         </div>
       </header>
 
-      <div className="grid grid-cols-1 xl:grid-cols-[1fr_420px] gap-6">
+      <div className="relative">
+        <div className={cn('grid grid-cols-1 xl:grid-cols-[1fr_420px] gap-6', isGuest && 'pointer-events-none select-none blur-[3px] opacity-45')}>
         <section className="bg-surface-container border border-outline-variant p-5 space-y-5">
           <div
             className="border-2 border-dashed border-outline-variant bg-surface-container-lowest hover:border-primary/60 transition-colors cursor-pointer"
@@ -4219,6 +5557,16 @@ const ProtectInterface = () => {
             </div>
           )}
         </aside>
+        </div>
+        {isGuest && (
+          <div className="absolute inset-0 z-10 flex items-center justify-center p-6">
+            <div className="max-w-xl border border-primary/30 bg-surface-container/95 backdrop-blur-sm p-6 text-center space-y-3">
+              <Shield className="w-10 h-10 text-primary mx-auto" />
+              <p className="font-mono text-sm uppercase tracking-widest text-on-surface">Signed Up Users Only</p>
+              <p className="font-mono text-[10px] text-outline uppercase">This feature should be used by the Signed Up users.</p>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -4447,10 +5795,10 @@ export default function App() {
       </div>
 
       <nav className="flex-1 py-4">
-        {!isGuestSession && <NavItem id="DASHBOARD" label="Dashboard" icon={Search} onClick={() => { setActiveTab('DASHBOARD'); onClose?.(); }} />}
+        <NavItem id="DASHBOARD" label="Dashboard" icon={Search} onClick={() => { setActiveTab('DASHBOARD'); onClose?.(); }} />
         <NavItem id="PROTECT" label="Protect" icon={Shield} onClick={() => { setActiveTab('PROTECT'); onClose?.(); }} />
         <NavItem id="SCAN" label="Scan" icon={UploadCloud} onClick={() => { setActiveTab('SCAN'); onClose?.(); }} />
-        {!isGuestSession && <NavItem id="HISTORY" label="History" icon={History} onClick={() => { setActiveTab('HISTORY'); onClose?.(); }} />}
+        <NavItem id="HISTORY" label="History" icon={History} onClick={() => { setActiveTab('HISTORY'); onClose?.(); }} />
         <NavItem id="INTELLIGENCE" label="Intelligence" icon={Cpu} onClick={() => { setActiveTab('INTELLIGENCE'); onClose?.(); }} />
       </nav>
 
@@ -4588,7 +5936,7 @@ export default function App() {
                   exit="exit"
                   className="h-full"
                 >
-                  <ScanInterface />
+                  <ScanInterface onNavigateToDashboard={() => setActiveTab('DASHBOARD')} />
                 </motion.div>
               )}
               {activeTab === 'METADATA' && (

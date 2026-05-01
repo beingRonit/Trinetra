@@ -75,6 +75,21 @@ class AssetRepo:
         )
         return [self._row_to_model(row) for row in (res.data or [])]
 
+    async def list_by_users(self, user_ids: list[str], limit: int = 20) -> list[AssetObject]:
+        if not user_ids:
+            return []
+
+        res = (
+            get_db()
+            .table(self.TABLE)
+            .select("*")
+            .in_("user_id", user_ids)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return [self._row_to_model(row) for row in (res.data or [])]
+
     async def delete_for_user(self, media_id: str, user_id: str) -> AssetObject | None:
         existing = (
             get_db()
@@ -89,6 +104,25 @@ class AssetRepo:
             return None
 
         get_db().table(self.TABLE).delete().eq("id", media_id).eq("user_id", user_id).execute()
+        return self._row_to_model(existing.data[0])
+
+    async def delete_for_users(self, media_id: str, user_ids: list[str]) -> AssetObject | None:
+        if not user_ids:
+            return None
+
+        existing = (
+            get_db()
+            .table(self.TABLE)
+            .select("*")
+            .eq("id", media_id)
+            .in_("user_id", user_ids)
+            .limit(1)
+            .execute()
+        )
+        if not existing.data:
+            return None
+
+        get_db().table(self.TABLE).delete().eq("id", media_id).in_("user_id", user_ids).execute()
         return self._row_to_model(existing.data[0])
 
     async def update_embedding(self, media_id: str, embedding: list[float]) -> None:

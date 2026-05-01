@@ -13,7 +13,10 @@ print("CLIP loaded")
 
 print("Loading BLIP model...")
 try:
-    blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base", use_fast=False)
+    blip_processor = BlipProcessor.from_pretrained(
+        "Salesforce/blip-image-captioning-base",
+        backend="pil",
+    )
     blip_model = BlipForConditionalGeneration.from_pretrained(
         "Salesforce/blip-image-captioning-base"
     ).to(device)

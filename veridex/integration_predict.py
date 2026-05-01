@@ -7,8 +7,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.config import CNN_THRESHOLD  # noqa: E402
-from app.models.cnn_classifier import CNNClassifier  # noqa: E402
+from app.services.intelligence_engine import analyze_image_bytes  # noqa: E402
 
 
 def main() -> int:
@@ -21,34 +20,8 @@ def main() -> int:
         print(json.dumps({"error": f"Image not found: {image_path}"}))
         return 1
 
-    classifier = CNNClassifier(weights_path=str(ROOT / "resnet50_veridex.pt"))
-
     with image_path.open("rb") as handle:
-        result = classifier.predict(handle.read())
-
-    ai_probability = float(result.get("ai_probability", 0.0))
-    real_probability = float(result.get("real_probability", max(0.0, 1.0 - ai_probability)))
-    total = ai_probability + real_probability
-    if total > 0:
-        ai_probability /= total
-        real_probability /= total
-
-    if ai_probability >= CNN_THRESHOLD:
-        label = "AI GENERATED"
-    elif ai_probability >= 0.4:
-        label = "SUSPICIOUS"
-    else:
-        label = "LIKELY REAL"
-
-    payload = {
-        "label": label,
-        "ai_probability": ai_probability,
-        "real_probability": real_probability,
-        "threshold": CNN_THRESHOLD,
-        "model": "Veridex CNN (ResNet50)",
-        "weights": "resnet50_veridex.pt",
-        "raw_score": int(round(ai_probability * 100)),
-    }
+        payload = analyze_image_bytes(handle.read(), filename=image_path.name)
     print(json.dumps(payload))
     return 0
 

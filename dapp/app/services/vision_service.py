@@ -31,7 +31,8 @@ class VisionService:
         self.clip_model.eval()
         
         self.blip_processor = BlipProcessor.from_pretrained(
-            os.getenv("BLIP_MODEL_ID", "Salesforce/blip-image-captioning-base")
+            os.getenv("BLIP_MODEL_ID", "Salesforce/blip-image-captioning-base"),
+            backend="pil",
         )
         self.blip_model = BlipForConditionalGeneration.from_pretrained(
             os.getenv("BLIP_MODEL_ID", "Salesforce/blip-image-captioning-base")

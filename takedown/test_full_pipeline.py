@@ -20,7 +20,10 @@ print("🔄 Loading models...")
 
 clip_model, preprocess = clip.load("ViT-B/32", device=device)
 
-processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+processor = BlipProcessor.from_pretrained(
+    "Salesforce/blip-image-captioning-base",
+    backend="pil",
+)
 blip_model = BlipForConditionalGeneration.from_pretrained(
     "Salesforce/blip-image-captioning-base"
 ).to(device)

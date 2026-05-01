@@ -1,93 +1,88 @@
-from functools import lru_cache
-from pathlib import Path
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
-
-from app.config import CNN_THRESHOLD
-from app.modules.forensics import analyze_forensics
-from app.modules.fusion import fuse_scores
-from app.modules.metadata import analyze_metadata
-from app.models.cnn_classifier import CNNClassifier
-from app.models.zero_shot_ai_classifier import ZeroShotAIClassifier
+from app.services.feedback_runtime import AI_LABEL, REAL_LABEL, enqueue_feedback_job, get_job_status
+from app.services.intelligence_engine import analyze_image_bytes
 
 
 router = APIRouter(prefix="/intelligence/veridex", tags=["intelligence"])
 
 ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp"}
 MAX_SIZE_MB = 10
-WEIGHTS_NAME = "resnet50_veridex.pt"
+ALLOWED_PREDICTIONS = {AI_LABEL, REAL_LABEL}
 
 
-@lru_cache(maxsize=1)
-def get_classifier() -> CNNClassifier:
-    base_dir = Path(__file__).resolve().parents[2]
-    weights_path = base_dir / WEIGHTS_NAME
-    if not weights_path.exists():
-        raise RuntimeError(f"Veridex weights not found: {weights_path}")
-    return CNNClassifier(weights_path=str(weights_path))
-
-
-@lru_cache(maxsize=1)
-def get_zero_shot_classifier() -> ZeroShotAIClassifier:
-    return ZeroShotAIClassifier()
-
-
-@router.post("/analyze")
-async def analyze_intelligence_image(file: UploadFile = File(...)):
+def _validate_upload(file: UploadFile, image_bytes: bytes) -> None:
     content_type = file.content_type or "image/webp"
     if content_type not in ALLOWED_TYPES:
         raise HTTPException(status_code=400, detail=f"Only JPEG, PNG, WebP allowed. Got: {content_type}")
 
-    image_bytes = await file.read()
     if len(image_bytes) > MAX_SIZE_MB * 1024 * 1024:
         raise HTTPException(status_code=400, detail=f"File too large. Max {MAX_SIZE_MB}MB")
 
+
+@router.post("/analyze")
+async def analyze_intelligence_image(file: UploadFile = File(...)):
+    image_bytes = await file.read()
+    _validate_upload(file, image_bytes)
+
     try:
-        classifier = get_classifier()
-        zero_shot_classifier = get_zero_shot_classifier()
-        prediction = classifier.predict(image_bytes)
-        zero_shot_prediction = zero_shot_classifier.predict(image_bytes)
-        metadata = analyze_metadata(image_bytes)
-        forensics = analyze_forensics(image_bytes)
+        return analyze_image_bytes(image_bytes, filename=file.filename or "uploaded-image")
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Veridex inference failed: {exc}") from exc
 
-    cnn_ai_probability = float(prediction.get("ai_probability", 0.0))
-    classifier_score = int(round(cnn_ai_probability * 40))
-    fused_score = fuse_scores(
-        metadata.get("score", 0),
-        forensics.get("score", 0),
-        classifier_score,
-        0,
-    )
-    heuristic_ai_probability = max(0.0, min(1.0, fused_score / 100.0))
-    zero_shot_ai_probability = float(zero_shot_prediction.get("ai_probability", 0.0))
-    ai_probability = max(cnn_ai_probability, heuristic_ai_probability, zero_shot_ai_probability)
-    real_probability = 1.0 - ai_probability
 
-    if ai_probability >= CNN_THRESHOLD:
-        label = "AI GENERATED"
-    elif ai_probability >= 0.4:
-        label = "SUSPICIOUS"
-    else:
-        label = "LIKELY REAL"
+@router.post("/feedback")
+async def submit_intelligence_feedback(
+    image: UploadFile = File(...),
+    prediction: str = Form(...),
+    user_feedback: str = Form(...),
+    confidence_score: float = Form(...),
+    ai_probability: float | None = Form(None),
+    real_probability: float | None = Form(None),
+    classifier_score: int | None = Form(None),
+):
+    prediction_value = prediction.upper()
+    feedback_value = user_feedback.upper()
+
+    if prediction_value not in ALLOWED_PREDICTIONS:
+        raise HTTPException(status_code=400, detail=f"Prediction must be one of {sorted(ALLOWED_PREDICTIONS)}")
+
+    if feedback_value == "SKIP":
+        raise HTTPException(status_code=400, detail="Skip must bypass feedback storage and training")
+
+    if feedback_value not in ALLOWED_PREDICTIONS:
+        raise HTTPException(status_code=400, detail=f"Feedback must be one of {sorted(ALLOWED_PREDICTIONS)}")
+
+    image_bytes = await image.read()
+    _validate_upload(image, image_bytes)
+
+    try:
+        job = enqueue_feedback_job(
+            image_bytes=image_bytes,
+            prediction=prediction_value,
+            user_feedback=feedback_value,
+            confidence_score=confidence_score,
+            ai_probability=ai_probability,
+            real_probability=real_probability,
+            classifier_score=classifier_score,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to enqueue feedback job: {exc}") from exc
 
     return {
-        "label": label,
-        "ai_probability": ai_probability,
-        "real_probability": real_probability,
-        "threshold": CNN_THRESHOLD,
-        "model": "Veridex CNN (ResNet50)",
-        "engine": "Veridex",
-        "weights": WEIGHTS_NAME,
-        "raw_score": fused_score,
-        "filename": file.filename or "uploaded-image",
-        "component_scores": {
-            "metadata": metadata.get("score", 0),
-            "forensics": forensics.get("score", 0),
-            "cnn": int(round(cnn_ai_probability * 100)),
-            "zero_shot": int(round(zero_shot_ai_probability * 100)),
-        },
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "stage": job["stage"],
+        "prediction": prediction_value,
+        "user_feedback": feedback_value,
     }
+
+
+@router.get("/feedback/jobs/{job_id}")
+async def get_feedback_job(job_id: str):
+    status = get_job_status(job_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="Feedback job not found")
+    return status

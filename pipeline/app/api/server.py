@@ -3,22 +3,26 @@ import uuid
 import shutil
 import asyncio
 import io
+import base64
 import traceback
 import sys
 import json
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
+import requests
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from app import run_pipeline_async
+from app.pipeline import get_last_run_summary
 from app.validator import validate_image, ImageValidationError
 from app.extraction import extract_all_features
 from app.phash import get_phash_from_bytes
-from app.db import insert_image_features, find_existing_by_phash, get_connection, search_local_vectors
+from app.db import insert_image_features, find_existing_by_phash, get_connection, search_local_vectors, fetch_media_file_url
 
 # Calculate paths relative to this file's location
 _current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -30,6 +34,9 @@ UPLOAD_DIR = os.path.join(PIPELINE_DIR, "data", "uploads")
 VERIDEX_DIR = os.path.join(INTEGRATION_ROOT, "veridex")
 VERIDEX_PYTHON = os.path.join(VERIDEX_DIR, "venv", "Scripts", "python.exe")
 VERIDEX_RUNNER = os.path.join(VERIDEX_DIR, "integration_predict.py")
+VERIDEX_API_URL = os.environ.get("VERIDEX_API_URL", "http://127.0.0.1:8001")
+VERIDEX_HEALTH_URL = f"{VERIDEX_API_URL.rstrip('/')}/health"
+_veridex_sidecar_process = None
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -65,6 +72,64 @@ if os.path.exists(FRONTEND_DIST):
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "data", "output")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+def sanitize_pipeline_results(results):
+    sanitized = []
+    for item in results[:5]:
+        sanitized.append({
+            "source": item.get("source"),
+            "final": round(float(item.get("final", 0)), 2),
+            "clip": round(float(item.get("clip", 0)), 4),
+            "phash": round(float(item.get("phash", 0)), 4),
+            "risk": item.get("risk"),
+            "fraud": item.get("fraud"),
+            "explanation": item.get("explanation"),
+            "label": item.get("label"),
+            "action": item.get("action"),
+            "match_confident": bool(item.get("match_confident", False)),
+        })
+    return sanitized
+
+
+def is_veridex_api_healthy(timeout: float = 1.5) -> bool:
+    try:
+        response = requests.get(VERIDEX_HEALTH_URL, timeout=timeout)
+        return response.ok
+    except requests.RequestException:
+        return False
+
+
+def ensure_veridex_api_running(start_timeout: float = 20.0) -> None:
+    global _veridex_sidecar_process
+
+    if is_veridex_api_healthy():
+        return
+
+    if not os.path.exists(VERIDEX_PYTHON):
+        raise RuntimeError(f"Veridex runtime not found at {VERIDEX_PYTHON}")
+
+    if _veridex_sidecar_process is None or _veridex_sidecar_process.poll() is not None:
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        _veridex_sidecar_process = subprocess.Popen(
+            [VERIDEX_PYTHON, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8001"],
+            cwd=VERIDEX_DIR,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creation_flags,
+        )
+
+    deadline = time.monotonic() + start_timeout
+    while time.monotonic() < deadline:
+        if is_veridex_api_healthy():
+            return
+
+        if _veridex_sidecar_process and _veridex_sidecar_process.poll() is not None:
+            raise RuntimeError("Veridex sidecar exited before becoming ready")
+
+        time.sleep(0.4)
+
+    raise RuntimeError("Veridex sidecar did not become ready in time")
 
 @app.get("/api/visualization/{filename}")
 @app.get("/visualization/{filename}")
@@ -138,7 +203,8 @@ async def login(
 @app.post("/register")
 async def register_image(
     artist_name: str = Form(...),
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    user_email: str = Form("")
 ):
     file_obj = io.BytesIO()
 
@@ -182,11 +248,22 @@ async def register_image(
 
         print("DEBUG: Inserting to DB...")
         sys.stdout.flush()
+        preview_url = f"data:{getattr(file, 'content_type', None) or 'image/jpeg'};base64,{base64.b64encode(image_data).decode('ascii')}"
+        enriched_metadata = {
+            **(features["ela_metadata"] or {}),
+            "artist_name": artist_name,
+            "filename": getattr(file, "filename", "uploaded.jpg"),
+            "mime_type": getattr(file, "content_type", None) or "image/jpeg",
+            "preview_url": preview_url,
+            "user_email": user_email.strip().lower(),
+            "blip_captions": features["blip_captions"],
+        }
+
         asset_id = insert_image_features(
             media_id=0,
             phash=phash,
             clip_embedding=features["clip_embedding"].cpu().numpy().tolist()[0],
-            metadata=features["ela_metadata"],
+            metadata=enriched_metadata,
         )
 
         return JSONResponse({
@@ -276,17 +353,45 @@ async def analyze_image(file: UploadFile = File(...)):
 
         if local_matches and local_matches[0]["similarity"] >= 0.80:
             print(f"Match found in local DB! Similarity: {local_matches[0]['similarity']}")
+            local_match = local_matches[0]
+            local_metadata = local_match.get("metadata") or {}
+            if isinstance(local_metadata, str):
+                try:
+                    local_metadata = json.loads(local_metadata)
+                except Exception:
+                    local_metadata = {}
+            local_preview_url = local_metadata.get("preview_url") or local_metadata.get("image_url")
+            if not local_preview_url and local_match.get("media_id") and str(local_match.get("media_id")) != "0":
+                local_preview_url = fetch_media_file_url(local_match.get("media_id"))
+            local_filename = (
+                local_metadata.get("filename")
+                or local_metadata.get("title")
+                or local_metadata.get("artist_name")
+                or "local_db"
+            )
             return JSONResponse({
                 "source": "local_db",
                 "match_found": True,
-                "score": round(local_matches[0]["similarity"] * 100, 2),
+                "score": round(local_match["similarity"] * 100, 2),
                 "label": "MATCH FOUND",
                 "risk": "HIGH",
                 "fraud": "HIGH",
                 "action": "BLOCK",
-                "explanation": f"Exact match found in local database with {local_matches[0]['similarity']*100:.1f}% similarity",
-                "matched_id": local_matches[0]["id"],
-                "similarity": local_matches[0]["similarity"],
+                "explanation": f"Exact match found in local database with {local_match['similarity']*100:.1f}% similarity",
+                "matched_id": local_match["id"],
+                "matched_media_id": local_match.get("media_id"),
+                "matched_phash": local_match.get("phash"),
+                "matched_file": local_filename,
+                "matched_image_url": local_preview_url,
+                "similarity": local_match["similarity"],
+                "web_search_attempted": False,
+                "local_match": {
+                    "id": local_match["id"],
+                    "media_id": local_match.get("media_id"),
+                    "phash": local_match.get("phash"),
+                    "image_url": local_preview_url,
+                    "filename": local_filename,
+                },
                 "blip_captions": blip_captions,
                 "uploaded_image_analysis": uploaded_image_analysis,
             })
@@ -295,9 +400,62 @@ async def analyze_image(file: UploadFile = File(...)):
         pipeline_results = await run_pipeline_async(temp_path)
 
         if not pipeline_results:
-            return JSONResponse({"error": "No results"}, status_code=400)
+            run_summary = get_last_run_summary()
+            searched_candidates = run_summary.get("searched_candidates", 0)
+            filtered_self_matches = run_summary.get("filtered_self_matches", 0)
+            downloaded_candidates = run_summary.get("downloaded_candidates", 0)
+            explanation = (
+                "Web search completed, but only self or near-self matches were found and excluded"
+                if filtered_self_matches > 0 and downloaded_candidates > 0
+                else "Web search completed, but no external matches were found for this image"
+            )
+            return JSONResponse({
+                "source": "web",
+                "match_found": False,
+                "score": 0,
+                "label": "NO EXTERNAL MATCH",
+                "risk": "LOW",
+                "fraud": "LOW",
+                "action": "PASS",
+                "explanation": explanation,
+                "web_search_attempted": True,
+                "searched_candidates": searched_candidates,
+                "downloaded_candidates": downloaded_candidates,
+                "filtered_self_matches": filtered_self_matches,
+                "blip_captions": blip_captions,
+                "uploaded_image_analysis": uploaded_image_analysis,
+                "clip_score": 0,
+                "phash_score": 0,
+                "all_results": []
+            })
 
         best = pipeline_results[0]
+
+        if not best.get("match_confident", False):
+            run_summary = get_last_run_summary()
+            comparison_image = None
+            if best.get("visual"):
+                comparison_image = f"/api/visualization/{os.path.basename(best['visual'])}"
+            return JSONResponse({
+                "source": "web",
+                "match_found": False,
+                "score": round(best.get("final", 0), 2),
+                "label": "NO EXTERNAL MATCH",
+                "risk": "LOW",
+                "fraud": "LOW",
+                "action": "PASS",
+                "explanation": f"{best.get('explanation') or 'Low confidence web result'} | Strong external evidence was not found",
+                "web_search_attempted": True,
+                "searched_candidates": run_summary.get("searched_candidates", 0),
+                "downloaded_candidates": run_summary.get("downloaded_candidates", 0),
+                "filtered_self_matches": run_summary.get("filtered_self_matches", 0),
+                "visual": comparison_image,
+                "blip_captions": blip_captions,
+                "uploaded_image_analysis": uploaded_image_analysis,
+                "clip_score": round(best.get("clip", 0) * 100, 2),
+                "phash_score": round(best.get("phash", 0) * 100, 2),
+                "all_results": sanitize_pipeline_results(pipeline_results),
+            })
 
         comparison_image = None
         if best.get("visual"):
@@ -312,14 +470,15 @@ async def analyze_image(file: UploadFile = File(...)):
             "explanation": best["explanation"],
             "source": best.get("source"),
             "visual": comparison_image,
+            "web_search_attempted": True,
             "blip_captions": blip_captions,
             "uploaded_image_analysis": uploaded_image_analysis,
             "clip_score": round(best.get("clip", 0) * 100, 2),
             "phash_score": round(best.get("phash", 0) * 100, 2),
-            "all_results": pipeline_results[:5]
+            "all_results": sanitize_pipeline_results(pipeline_results)
         }
 
-        return response
+        return JSONResponse(response)
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -380,3 +539,71 @@ async def analyze_with_veridex(file: UploadFile = File(...)):
     finally:
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
+
+
+@app.post("/intelligence/veridex/feedback")
+async def submit_veridex_feedback(
+    image: UploadFile = File(...),
+    prediction: str = Form(...),
+    user_feedback: str = Form(...),
+    confidence_score: float = Form(...),
+    ai_probability: float | None = Form(None),
+    real_probability: float | None = Form(None),
+    classifier_score: int | None = Form(None),
+):
+    try:
+        await asyncio.to_thread(ensure_veridex_api_running)
+        image_bytes = await image.read()
+        files = {
+            "image": (
+                getattr(image, "filename", "feedback-image.jpg"),
+                image_bytes,
+                image.content_type or "image/jpeg",
+            )
+        }
+        data = {
+            "prediction": prediction,
+            "user_feedback": user_feedback,
+            "confidence_score": str(confidence_score),
+        }
+        if ai_probability is not None:
+            data["ai_probability"] = str(ai_probability)
+        if real_probability is not None:
+            data["real_probability"] = str(real_probability)
+        if classifier_score is not None:
+            data["classifier_score"] = str(classifier_score)
+
+        response = await asyncio.to_thread(
+            requests.post,
+            f"{VERIDEX_API_URL}/intelligence/veridex/feedback",
+            files=files,
+            data=data,
+            timeout=60,
+        )
+        payload = response.json()
+        return JSONResponse(payload, status_code=response.status_code)
+    except requests.RequestException as exc:
+        return JSONResponse({"error": f"Veridex feedback service unavailable: {exc}"}, status_code=502)
+    except ValueError as exc:
+        return JSONResponse({"error": f"Invalid Veridex feedback response: {exc}"}, status_code=502)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/intelligence/veridex/feedback/jobs/{job_id}")
+async def get_veridex_feedback_job(job_id: str):
+    try:
+        await asyncio.to_thread(ensure_veridex_api_running)
+        response = await asyncio.to_thread(
+            requests.get,
+            f"{VERIDEX_API_URL}/intelligence/veridex/feedback/jobs/{job_id}",
+            timeout=30,
+        )
+        payload = response.json()
+        return JSONResponse(payload, status_code=response.status_code)
+    except requests.RequestException as exc:
+        return JSONResponse({"error": f"Veridex job service unavailable: {exc}"}, status_code=502)
+    except ValueError as exc:
+        return JSONResponse({"error": f"Invalid Veridex job response: {exc}"}, status_code=502)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)

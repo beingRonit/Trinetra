@@ -1,4 +1,5 @@
 import os
+import json
 import psycopg2
 import psycopg2.extras
 import numpy as np
@@ -37,6 +38,27 @@ def fetch_media_files(limit=5):
     conn.close()
 
     return rows
+
+
+def fetch_media_file_url(media_id):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT file_url
+            FROM public.media_files
+            WHERE id = %s
+            LIMIT 1
+        """, (media_id,))
+        row = cur.fetchone()
+        return row[0] if row else None
+    except Exception as e:
+        print(f"DB media file lookup error: {e}")
+        return None
+    finally:
+        cur.close()
+        conn.close()
 
 
 def insert_scan_result(media_id, score, label, risk, fraud):
@@ -91,7 +113,6 @@ def phash_similarity_str(h1_str: str, h2_str: str):
 
 
 def insert_image_features(media_id: int, phash: str, clip_embedding: list, metadata: dict):
-    import json
     conn = get_connection()
     cur = conn.cursor()
 
@@ -126,7 +147,7 @@ def search_local_vectors(clip_embedding: list, top_k: int = 5, similarity_thresh
 
     try:
         cur.execute("""
-            SELECT id, phash, clip_embedding, metadata
+            SELECT id, media_id, phash, clip_embedding, metadata
             FROM public.image_features
             WHERE clip_embedding IS NOT NULL
             LIMIT 500
@@ -136,15 +157,22 @@ def search_local_vectors(clip_embedding: list, top_k: int = 5, similarity_thresh
 
         results = []
         for row in rows:
-            stored_embedding = np.array(json.loads(row[2]))
+            stored_embedding = np.array(json.loads(row[3]))
             similarity = float(np.dot(embedding_arr, stored_embedding))
+            metadata = row[4]
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except Exception:
+                    metadata = {}
 
             if similarity >= similarity_threshold:
                 results.append({
                     "id": row[0],
-                    "phash": row[1],
+                    "media_id": row[1],
+                    "phash": row[2],
                     "similarity": similarity,
-                    "metadata": row[3]
+                    "metadata": metadata if isinstance(metadata, dict) else {}
                 })
 
         results.sort(key=lambda x: x["similarity"], reverse=True)

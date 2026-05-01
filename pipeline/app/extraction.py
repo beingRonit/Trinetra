@@ -1,6 +1,7 @@
 import asyncio
 import io
 import sys
+import torch
 print("DEBUG extraction.py: START OF FILE", file=sys.stderr)
 sys.stderr.flush()
 
@@ -24,17 +25,27 @@ async def extract_all_features(image_data: bytes):
     import sys
     print("DEBUG extraction.py: START", file=sys.stderr)
     sys.stderr.flush()
-        
-    clip_task = asyncio.to_thread(get_embedding_from_bytes, image_data)
-    blip_task = asyncio.to_thread(generate_captions_from_bytes, image_data)
-    ela_task  = asyncio.to_thread(run_ela_metadata, image_data)
 
-    print("DEBUG extraction.py: Awaiting gather...")
-    sys.stdout.flush()
-    clip_emb, blip_captions, ela_metadata = await asyncio.gather(
-        clip_task, blip_task, ela_task
-    )
-    print("DEBUG extraction.py: Gather complete")
+    # On CPU, running CLIP and BLIP at the same time usually slows both jobs down.
+    # Keep model inference serialized there and only overlap the lighter ELA metadata work.
+    ela_task = asyncio.to_thread(run_ela_metadata, image_data)
+
+    if torch.cuda.is_available():
+        clip_task = asyncio.to_thread(get_embedding_from_bytes, image_data)
+        blip_task = asyncio.to_thread(generate_captions_from_bytes, image_data)
+        print("DEBUG extraction.py: Awaiting GPU gather...", file=sys.stderr)
+        sys.stderr.flush()
+        clip_emb, blip_captions, ela_metadata = await asyncio.gather(
+            clip_task, blip_task, ela_task
+        )
+    else:
+        print("DEBUG extraction.py: CPU mode, running inference sequentially", file=sys.stderr)
+        sys.stderr.flush()
+        clip_emb = await asyncio.to_thread(get_embedding_from_bytes, image_data)
+        blip_captions = await asyncio.to_thread(generate_captions_from_bytes, image_data)
+        ela_metadata = await ela_task
+
+    print("DEBUG extraction.py: Feature extraction complete")
     sys.stdout.flush()
 
     phash = get_phash_from_bytes(image_data)

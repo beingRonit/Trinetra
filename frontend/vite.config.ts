@@ -5,6 +5,8 @@ import {defineConfig, loadEnv} from 'vite';
 
 export default defineConfig(({mode}) => {
   const env = loadEnv(mode, '.', '');
+  const dappTarget = env.VITE_DAPP_API_URL || 'http://127.0.0.1:3004';
+  const pipelineTarget = env.VITE_PIPELINE_API_URL || 'http://127.0.0.1:8003';
   return {
     base: '/',
     plugins: [react(), tailwindcss()],
@@ -23,31 +25,31 @@ export default defineConfig(({mode}) => {
       host: '0.0.0.0',
       proxy: {
         '/api/auth': {
-          target: 'http://127.0.0.1:3003',
+          target: dappTarget,
           changeOrigin: true,
         },
         '/api/dashboard': {
-          target: 'http://127.0.0.1:3003',
+          target: dappTarget,
           changeOrigin: true,
         },
         '/assets': {
-          target: 'http://127.0.0.1:3003',
+          target: dappTarget,
           changeOrigin: true,
         },
         '/takedown': {
-          target: 'http://127.0.0.1:3003',
+          target: dappTarget,
           changeOrigin: true,
         },
         '/api': {
-          target: 'http://127.0.0.1:8003',
+          target: pipelineTarget,
           changeOrigin: true,
           rewrite: (path) => path.replace(/^\/api/, ''),
         },
-        '/register': 'http://127.0.0.1:8003',
-        '/analyze-image': 'http://127.0.0.1:8003',
-        '/ingest': 'http://127.0.0.1:8003',
-        '/login': 'http://127.0.0.1:3003',
-        '/signup': 'http://127.0.0.1:3003',
+        '/register': pipelineTarget,
+        '/analyze-image': pipelineTarget,
+        '/ingest': pipelineTarget,
+        '/login': dappTarget,
+        '/signup': dappTarget,
       },
     },
     build: {

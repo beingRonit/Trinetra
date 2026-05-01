@@ -1,24 +1,30 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter
-from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+
 from app.routes.analyze import router as analyze_router
 from app.routes.heatmap import router as heatmap_router
-from app.routes.feedback import router as feedback_router
 from app.routes.intelligence import router as intelligence_router
-from app.db.database import engine
-from app.db.models import Base
-from app.utils.training_utils import get_training_stats, retrain_from_staging
+from app.services.feedback_runtime import (
+    get_runtime_feedback_stats,
+    initialize_feedback_runtime,
+    start_feedback_worker,
+    stop_feedback_worker,
+)
+
 
 limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(title="VERIDEX")
 app.state.limiter = limiter
 
+
 @app.exception_handler(RateLimitExceeded)
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return {"detail": f"Rate limit exceeded: {exc.detail}"}
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,27 +35,37 @@ app.add_middleware(
 
 app.include_router(analyze_router)
 app.include_router(heatmap_router)
-app.include_router(feedback_router)
 app.include_router(intelligence_router)
 
-Base.metadata.create_all(bind=engine)
+
+@app.on_event("startup")
+async def startup_event():
+    initialize_feedback_runtime()
+    await start_feedback_worker()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await stop_feedback_worker()
+
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+
 @app.get("/stats")
 def stats():
-    training_stats = get_training_stats()
     return {
         "status": "ok",
         "rate_limit": "100 requests/minute",
-        "cache_size": "max 10,000 entries",
-        "training": training_stats
+        "runtime_feedback": get_runtime_feedback_stats(),
     }
 
+
 @app.post("/retrain")
-def trigger_retrain(force: bool = False):
-    """Manually trigger retraining from staging files."""
-    result = retrain_from_staging(force=force)
-    return result
+def trigger_retrain():
+    return {
+        "success": False,
+        "message": "Manual retraining is disabled for the temporary feedback workflow. Submit valid feedback instead.",
+    }

@@ -68,6 +68,27 @@ class ReportObject(BaseModel):
     generated_at: datetime
 
 
+class TakedownReportRequest(BaseModel):
+    reporter_name: str
+    reporter_email: str
+    reporter_user_id: Optional[str] = None
+    account_joined_since: Optional[str] = None
+    rights_holder: str
+    asset_id: Optional[str] = None
+    asset_filename: str
+    asset_mime_type: Optional[str] = None
+    asset_size_bytes: Optional[int] = None
+    verdict: Optional[str] = None
+    final_score: float
+    matched_reference: Optional[str] = None
+    matched_source: Optional[str] = None
+    target_url: str
+    contact_email: Optional[str] = None
+    issue_summary: str
+    notes: Optional[str] = None
+    declaration_accepted: bool = False
+
+
 class PipelineInput(BaseModel):
     image_bytes: bytes
     storage_key: str
