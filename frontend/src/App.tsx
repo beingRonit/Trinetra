@@ -71,6 +71,25 @@ type PipelineStep =
 
 type PipelineStatus = 'idle' | 'running' | 'paused' | 'complete' | 'error';
 type VerdictType = 'Authentic' | 'Manipulated' | 'Suspicious' | 'Match Found' | 'NO EXTERNAL MATCH' | 'Error' | null;
+type AuthApiResponse = {
+  detail?: string;
+  error?: string;
+  access_token?: string;
+  token?: string;
+};
+
+const parseAuthResponse = async (response: Response): Promise<AuthApiResponse> => {
+  const rawBody = await response.text();
+  if (!rawBody.trim()) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(rawBody) as AuthApiResponse;
+  } catch {
+    return response.ok ? {} : { detail: rawBody };
+  }
+};
 
 const sectionTransition: Variants = {
   initial: { opacity: 0, y: 18, filter: 'blur(10px)' },
@@ -2227,9 +2246,9 @@ const LegacyAuthScreen = ({ onLogin }: { onLogin: () => void }) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: normalizedEmail }),
       });
-      const result = await response.json();
+      const result = await parseAuthResponse(response);
       if (!response.ok) {
-        throw new Error(result.detail || 'Failed to send OTP');
+        throw new Error(result.detail || result.error || 'Failed to send OTP');
       }
       setOtpSent(true);
       setMessage({ type: 'success', text: `OTP sent to ${normalizedEmail}. Check your inbox.` });
@@ -2255,11 +2274,11 @@ const LegacyAuthScreen = ({ onLogin }: { onLogin: () => void }) => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: normalizedEmail, otp: otp.trim() }),
       });
-      const result = await response.json();
+      const result = await parseAuthResponse(response);
       if (!response.ok) {
-        throw new Error(result.detail || 'OTP verification failed');
+        throw new Error(result.detail || result.error || 'OTP verification failed');
       }
-      localStorage.setItem('trinetra_access_token', result.access_token);
+      localStorage.setItem('trinetra_access_token', result.access_token || result.token || '');
       localStorage.setItem('trinetra_user_email', normalizedEmail);
       setMessage({ type: 'success', text: 'Verification successful. Starting secure session...' });
       setTimeout(() => onLogin(), 400);
