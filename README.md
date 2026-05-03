@@ -2,17 +2,20 @@
   <img src="frontend/src/assets/banner.png" alt="Trinetra — Media Asset Protection" width="100%">
 </p>
 
-<div align="center">
-  <img src="frontend/src/assets/trinetra-logo-transparent.png" alt="Trinetra Logo" width="100">
+<p align="center">
+  <img src="frontend/src/assets/trinetra-logo-transparent.png" alt="Trinetra Logo" width="200">
+</p>
 
-```
+<pre align="center">
 ████████╗██████╗ ██╗███╗   ██╗███████╗████████╗██████╗  █████╗ 
 ╚══██╔══╝██╔══██╗██║████╗  ██║██╔════╝╚══██╔══╝██╔══██╗██╔══██╗
    ██║   ██████╔╝██║██╔██╗ ██║█████╗     ██║   ██████╔╝███████║
    ██║   ██╔══██╗██║██║╚██╗██║██╔══╝     ██║   ██╔══██╗██╔══██║
    ██║   ██║  ██║██║██║ ╚████║███████╗   ██║   ██║  ██║██║  ██║
    ╚═╝   ╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝╚══════╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝
-```
+</pre>
+
+<div align="center">
 
 ### The open-source media fingerprinting and IP enforcement platform.
 
